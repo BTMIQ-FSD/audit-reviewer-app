@@ -1,0 +1,29 @@
+SOURCE: IAS 1 (Presentation of Financial Statements), ISA 230 (Audit Documentation), ISA 500 (Audit Evidence)
+STATUS: Firm summary of key requirements (to be replaced with the firm's licensed official text)
+
+IAS 1 — PRESENTATION OF FINANCIAL STATEMENTS
+- Financial statements must present fairly the entity's position, performance and cash flows (para 15).
+- Each material class of similar items is presented separately (para 29).
+- The notes must be cross-referenced with the face of the statements, and the figures must agree between the face of the statements and the supporting notes (paras 112-116).
+- Comparative information is required for the preceding period (para 38).
+
+COMPANIES ACT 2017 (Pakistan) — s.225
+Financial statements must give a true and fair view of the state of the company's affairs. Books of account must be properly kept.
+
+ISA 230 — AUDIT DOCUMENTATION
+- Documentation must be sufficient for an EXPERIENCED AUDITOR with no previous connection to the audit to understand: the nature, timing and extent of procedures performed; the results and evidence obtained; and significant matters, conclusions, and judgements (para 8).
+- Who performed and who reviewed the work, and the dates, must be recorded (para 9).
+- Documentation is assembled into the final file on a timely basis (para 14).
+
+ISA 500 — AUDIT EVIDENCE
+- The auditor must obtain SUFFICIENT (quantity) and APPROPRIATE (quality: relevance and reliability) audit evidence (para 6).
+- Evidence descriptions such as "reviewed and appears reasonable" without stating what was examined and why it supports the conclusion do not demonstrate sufficient appropriate evidence.
+- When using samples, the basis of selection and the items tested should be documented (see also ISA 530 on sampling: sample design, size, and selection must be documented, and deviations evaluated).
+
+AUDIT IMPLICATIONS FOR WORKING PAPERS
+- Lead schedules must agree exactly with the face of the financial statements; sub-leads must agree with the notes.
+- Conclusions must be supported by documented work — a conclusion of "no exceptions" alongside an exception described in the same paper is a contradiction.
+- Broken spreadsheet values (#REF!, #VALUE!, #DIV/0!) mean the schedule does not compute and must be fixed before the paper can support any conclusion.
+- Sign-offs (preparer, reviewer) with dates are required; reviewer dates should not precede preparer dates.
+- Working papers containing another client's name or file reference indicate copy-paste contamination from a reused template and must be corrected.
+- Unresolved review queries (e.g. "where is sub lead??") must be cleared before the file is closed.

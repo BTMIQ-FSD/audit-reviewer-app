@@ -1,0 +1,27 @@
+SOURCE: IFRS 15 — Revenue from Contracts with Customers
+STATUS: Firm summary of key requirements (to be replaced with the firm's licensed official text)
+
+CORE PRINCIPLE
+Revenue is recognised to depict the transfer of promised goods or services to customers, in an amount reflecting the consideration the entity expects to be entitled to.
+
+THE FIVE-STEP MODEL (paras 9-46)
+1. Identify the contract with the customer (para 9): enforceable rights and obligations, commercial substance, collection probable.
+2. Identify the performance obligations (paras 22-30): each distinct promise to transfer a good or service.
+3. Determine the transaction price (paras 47-72): the consideration the entity expects; exclude amounts collected on behalf of third parties (e.g. sales tax). Variable consideration (discounts, rebates) is estimated and constrained.
+4. Allocate the transaction price to the performance obligations (paras 73-90).
+5. Recognise revenue when (or as) a performance obligation is satisfied (paras 31-46).
+
+POINT IN TIME vs OVER TIME (paras 35-38)
+Revenue is recognised over time only if one of the para 35 criteria is met; otherwise at a point in time when CONTROL transfers (para 38). Indicators of control transfer include: present right to payment, legal title, physical possession, risks and rewards, customer acceptance.
+
+EXPORT SALES (application)
+For export sales recognised at a point in time, control typically transfers per shipping terms (e.g. bill of lading date for FOB). Cut-off testing near year end should be supported by shipping documents evidencing the transfer of control.
+
+PRESENTATION / DISCLOSURE (paras 105-129)
+Contract assets and contract liabilities are recognised and disclosed; revenue disaggregation is disclosed; amounts included in contract liabilities at the start of the period that were recognised as revenue in the period are disclosed.
+
+AUDIT IMPLICATIONS FOR A REVENUE WORKING PAPER
+- The stated recognition policy must match IFRS 15's control-transfer model.
+- Where point-in-time recognition is asserted for exports, the working paper should reference the shipping-document evidence tested (cut-off).
+- Amounts such as sales tax must be excluded from revenue (transaction price definition).
+- Rebates/discounts affect the transaction price and their treatment should be documented.

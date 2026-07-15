@@ -1,0 +1,21 @@
+SOURCE: IAS 24 — Related Party Disclosures
+STATUS: Firm summary of key requirements (to be replaced with the firm's licensed official text)
+
+PURPOSE
+To ensure financial statements disclose the possibility that the entity's position and results may have been affected by related parties and transactions with them.
+
+WHO IS A RELATED PARTY (para 9)
+Includes: entities under common control or ownership; key management personnel and their close family; entities controlled or jointly controlled by such persons.
+
+DISCLOSURE REQUIREMENTS (paras 13-24)
+- Relationships between parents and subsidiaries are disclosed regardless of transactions (para 13).
+- Where related party transactions occurred: the NATURE of the relationship, the AMOUNT of the transactions, outstanding BALANCES (including terms, security, guarantees), and provisions for doubtful debts (para 18).
+- Disclosures that related party transactions were made on terms equivalent to arm's length are made ONLY if such terms can be substantiated (para 23).
+
+AUDIT IMPLICATIONS FOR A REVENUE WORKING PAPER
+- Sales to related parties included in revenue must be identified and disclosed with amounts and relationship nature.
+- A claim of arm's-length pricing must be substantiated with evidence, not asserted.
+- The working paper should document the pricing basis and the audit procedures performed on related-party sales.
+
+RELATED AUDITING STANDARD: ISA 550 (Related Parties)
+Requires the auditor to identify related party relationships and transactions, understand their business rationale, and obtain sufficient appropriate evidence about their accounting and disclosure (ISA 550 paras 13-24).

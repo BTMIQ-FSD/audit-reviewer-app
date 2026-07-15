@@ -27,6 +27,29 @@ client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
 
 # ---------------------------------------------------------------------------
+# KNOWLEDGE BASE: load the firm's standards library (files in /knowledge)
+# The AI must check against THESE texts, not its own memory.
+# To update a standard later: replace the file, redeploy. No code change.
+# ---------------------------------------------------------------------------
+def load_knowledge_base():
+    kb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge")
+    sections = []
+    if os.path.isdir(kb_dir):
+        for fname in sorted(os.listdir(kb_dir)):
+            if fname.endswith(".txt"):
+                path = os.path.join(kb_dir, fname)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        sections.append(f.read().strip())
+                except Exception:
+                    pass
+    return "\n\n==========\n\n".join(sections)
+
+
+KNOWLEDGE_BASE = load_knowledge_base()
+
+
+# ---------------------------------------------------------------------------
 # STEP 1: Read the uploaded file and turn it into plain text the AI can review
 # ---------------------------------------------------------------------------
 def extract_text_from_file(filename, file_bytes):
@@ -86,6 +109,8 @@ For EACH issue you find, give:
 5. A suggested fix — what the team should do to resolve it
 
 IMPORTANT RULES:
+- You are given the FIRM'S STANDARDS LIBRARY below. Base every standard reference on that library. When your finding is supported by the library, cite it (e.g. "IFRS 15 — control transfer (per firm standards library)").
+- If an issue is real but the library does not cover it, still raise it, but mark the reference as "outside loaded library — reference to be confirmed".
 - Never invent a standard, paragraph number, or fact. If unsure, say so.
 - Write everything in easy-to-understand English.
 - Base your findings on what is actually in the document provided, not assumptions.
@@ -115,25 +140,91 @@ def review_with_ai(document_text):
         model="deepseek-chat",
         messages=[
             {"role": "system", "content": REVIEWER_INSTRUCTIONS},
+            {"role": "system", "content": f"FIRM'S STANDARDS LIBRARY (check against these texts):\n\n{KNOWLEDGE_BASE}"},
             {"role": "user", "content": f"Here is the working paper to review:\n\n{trimmed}"},
         ],
         max_tokens=3000,
         temperature=0.2,  # low = more consistent, less "creative"
     )
     raw = response.choices[0].message.content.strip()
+    return parse_ai_json(raw)
 
-    # DeepSeek sometimes wraps JSON in ```json fences — remove them
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
 
+def parse_ai_json(raw):
+    """Read the AI's JSON response, tolerating common formatting quirks."""
+    import re as _re
+    text = raw.strip()
+
+    # 1) Strip ```json fences if present
+    if text.startswith("```"):
+        parts = text.split("```")
+        if len(parts) >= 2:
+            text = parts[1]
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+        text = text.strip()
+
+    # 2) If there's chatter before/after, cut to the outermost { ... }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end + 1]
+
+    # 3) First attempt: parse as-is
     try:
-        return json.loads(raw), None
-    except Exception as e:
-        # If it didn't return clean JSON, show the raw text so nothing is hidden
-        return None, f"The AI's response could not be read as structured findings. Raw response:\n\n{raw}"
+        return json.loads(text), None
+    except Exception:
+        pass
+
+    # 4) Second attempt: fix the most common quirks
+    #    smart quotes -> normal quotes; remove trailing commas before } or ]
+    cleaned = (text
+               .replace("\u201c", '"').replace("\u201d", '"')
+               .replace("\u2018", "'").replace("\u2019", "'"))
+    cleaned = _re.sub(r",\s*([}\]])", r"\1", cleaned)
+    try:
+        return json.loads(cleaned), None
+    except Exception:
+        pass
+
+    # 5) Last resort: the response was cut off mid-way. Salvage the complete
+    #    findings by extracting every complete {...} object inside "findings".
+    try:
+        objs = []
+        depth = 0
+        buf = ""
+        in_list = False
+        i = cleaned.find('"findings"')
+        if i != -1:
+            rest = cleaned[i:]
+            for ch in rest:
+                if not in_list:
+                    if ch == "[":
+                        in_list = True
+                    continue
+                if ch == "{":
+                    depth += 1
+                if depth > 0:
+                    buf += ch
+                if ch == "}":
+                    depth -= 1
+                    if depth == 0 and buf.strip():
+                        try:
+                            objs.append(json.loads(buf))
+                        except Exception:
+                            pass  # skip the incomplete/broken one
+                        buf = ""
+                if ch == "]" and depth == 0:
+                    break
+        if objs:
+            return {"findings": objs,
+                    "summary": "Note: the AI's response was cut off, so the "
+                               "findings below may be incomplete."}, None
+    except Exception:
+        pass
+
+    return None, ("The AI's response could not be read as structured findings. "
+                  f"Raw response:\n\n{raw}")
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +277,7 @@ PAGE = """
   </div>
   <div class="sub">Baker Tilly · Revenue &amp; working-paper review (Stage 1)</div>
 
-  <div class="notice"><b>Note:</b> This build reviews using the AI's own knowledge of the standards. The next stage loads the firm's approved standards so every reference is exact. Use sample / public data for now.</div>
+  <div class="notice"><b>Note:</b> This build reviews against the firm's loaded standards library (summaries of IFRS 15, IAS 24, IAS 1, ISA 230, ISA 500 and related requirements). Official full texts can replace the summaries at any time without code changes. Use sample / public data until the tool moves to the firm's own server.</div>
 
   <div class="card">
     <form method="POST" enctype="multipart/form-data">
