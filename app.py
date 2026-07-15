@@ -21,6 +21,9 @@ from docx import Document as DocxDocument    # Word
 from pypdf import PdfReader                  # PDF
 
 app = Flask(__name__)
+# Cap uploads at 25 MB — larger files get a clear message instead of
+# exhausting the server's memory.
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
@@ -52,32 +55,70 @@ KNOWLEDGE_BASE = load_knowledge_base()
 # ---------------------------------------------------------------------------
 # STEP 1: Read the uploaded file and turn it into plain text the AI can review
 # ---------------------------------------------------------------------------
+# The AI is only ever sent this many characters, so never hold more than
+# slightly above it in memory (prevents out-of-memory on huge workbooks).
+MAX_EXTRACT_CHARS = 45000
+
+
 def extract_text_from_file(filename, file_bytes):
-    """Return the text content of an uploaded file, based on its type."""
+    """Return the text content of an uploaded file, based on its type.
+    Memory-frugal: stops reading once MAX_EXTRACT_CHARS is reached."""
     name = filename.lower()
 
     if name.endswith((".xlsx", ".xlsm")):
         text_parts = []
+        total = 0
         wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
-        for sheet in wb.worksheets:
-            text_parts.append(f"\n===== SHEET: {sheet.title} =====")
-            for row in sheet.iter_rows(values_only=True):
-                # keep only rows that actually have something in them
-                cells = [str(c) for c in row if c is not None and str(c).strip() != ""]
-                if cells:
-                    text_parts.append(" | ".join(cells))
+        try:
+            for sheet in wb.worksheets:
+                if total >= MAX_EXTRACT_CHARS:
+                    text_parts.append("\n[... file is large; remaining sheets not "
+                                      "included in this review pass ...]")
+                    break
+                header = f"\n===== SHEET: {sheet.title} ====="
+                text_parts.append(header)
+                total += len(header)
+                for row in sheet.iter_rows(values_only=True):
+                    cells = [str(c) for c in row
+                             if c is not None and str(c).strip() != ""]
+                    if cells:
+                        line = " | ".join(cells)
+                        text_parts.append(line)
+                        total += len(line)
+                        if total >= MAX_EXTRACT_CHARS:
+                            break
+        finally:
+            wb.close()
         return "\n".join(text_parts)
 
     elif name.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(file_bytes))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        parts = []
+        total = 0
+        for p in doc.paragraphs:
+            if p.text.strip():
+                parts.append(p.text)
+                total += len(p.text)
+                if total >= MAX_EXTRACT_CHARS:
+                    parts.append("[... document is large; remainder not included ...]")
+                    break
+        return "\n".join(parts)
 
     elif name.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(file_bytes))
-        return "\n".join((page.extract_text() or "") for page in reader.pages)
+        parts = []
+        total = 0
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            parts.append(t)
+            total += len(t)
+            if total >= MAX_EXTRACT_CHARS:
+                parts.append("[... document is large; remaining pages not included ...]")
+                break
+        return "\n".join(parts)
 
     elif name.endswith((".csv", ".txt")):
-        return file_bytes.decode("utf-8", errors="ignore")
+        return file_bytes.decode("utf-8", errors="ignore")[:MAX_EXTRACT_CHARS]
 
     else:
         return None  # unsupported type
