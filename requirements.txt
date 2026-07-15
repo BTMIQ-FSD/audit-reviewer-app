@@ -4,3 +4,4 @@ gunicorn
 openpyxl
 python-docx
 pypdf
+reportlab

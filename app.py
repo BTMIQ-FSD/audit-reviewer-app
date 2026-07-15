@@ -1,48 +1,99 @@
 """
-Baker Tilly AI Audit Reviewer — Stage 1 (Real Reviewer)
-Upload a working paper (Excel / PDF / Word) -> the tool reads it ->
-sends it to DeepSeek with proper audit-reviewer instructions ->
-returns review points in plain English, each with a reference and a suggested fix,
-ending with a professional-judgement statement.
+Baker Tilly AI Audit Reviewer — Stage 3
+Adds: login with authorised user accounts and access levels,
+multi-file drag-and-drop upload (up to 3 files per batch),
+downloadable findings (Excel and PDF), and larger AI responses (cut-off fix).
 
-NOTE: For now the AI reviews using its own knowledge of the standards.
-Stage 2 will add the firm's real knowledge base so every reference is exact.
+USER ACCOUNTS (managed by the administrator, never stored in this public code):
+Set an environment variable on Render called USERS in this format:
+    username:password:role;username2:password2:role2
+Roles:  full    = can review and download reports (Partner / Manager)
+        limited = can review only (no downloads)
+Example:
+    partner1:Str0ngPass!:full;manager1:An0therPass!:full;staff1:StaffPass1:limited
+If USERS is not set, a single default login exists:
+    admin / bakertilly2025  (full)  — CHANGE THIS by setting USERS.
+Also set SECRET_KEY to any long random text (keeps logins secure).
 """
 
 import os
 import io
 import json
-from flask import Flask, request, render_template_string
+import uuid
+import tempfile
+from functools import wraps
+from flask import (Flask, request, render_template_string, session,
+                   redirect, url_for, send_file)
 from openai import OpenAI
 
-# Libraries to read the different file types
-from openpyxl import load_workbook          # Excel
-from docx import Document as DocxDocument    # Word
-from pypdf import PdfReader                  # PDF
+from openpyxl import load_workbook, Workbook
+from docx import Document as DocxDocument
+from pypdf import PdfReader
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib import colors
 
 app = Flask(__name__)
-# Cap uploads at 25 MB — larger files get a clear message instead of
-# exhausting the server's memory.
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB per upload batch
+app.secret_key = os.environ.get("SECRET_KEY", "change-me-set-SECRET-KEY-env-var")
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
+MAX_FILES_PER_BATCH = 3
+MAX_EXTRACT_CHARS = 45000
+RESULTS_DIR = os.path.join(tempfile.gettempdir(), "audit_results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# KNOWLEDGE BASE: load the firm's standards library (files in /knowledge)
-# The AI must check against THESE texts, not its own memory.
-# To update a standard later: replace the file, redeploy. No code change.
-# ---------------------------------------------------------------------------
+
+def load_users():
+    """Users come from the USERS environment variable (set on Render).
+    Format: username:password:role;username2:password2:role2"""
+    raw = os.environ.get("USERS", "").strip()
+    users = {}
+    if raw:
+        for entry in raw.split(";"):
+            parts = entry.strip().split(":")
+            if len(parts) == 3:
+                name, pw, role = parts[0].strip(), parts[1], parts[2].strip().lower()
+                if name and pw and role in ("full", "limited"):
+                    users[name] = {"password": pw, "role": role}
+    if not users:
+        users["admin"] = {"password": "bakertilly2025", "role": "full"}
+    return users
+
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def full_access_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login"))
+        if session.get("role") != "full":
+            return "Downloads are available to full-access users only.", 403
+        return f(*args, **kwargs)
+    return wrapper
+
+
 def load_knowledge_base():
     kb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge")
     sections = []
     if os.path.isdir(kb_dir):
         for fname in sorted(os.listdir(kb_dir)):
             if fname.endswith(".txt"):
-                path = os.path.join(kb_dir, fname)
                 try:
-                    with open(path, "r", encoding="utf-8") as f:
+                    with open(os.path.join(kb_dir, fname), "r", encoding="utf-8") as f:
                         sections.append(f.read().strip())
                 except Exception:
                     pass
@@ -52,17 +103,7 @@ def load_knowledge_base():
 KNOWLEDGE_BASE = load_knowledge_base()
 
 
-# ---------------------------------------------------------------------------
-# STEP 1: Read the uploaded file and turn it into plain text the AI can review
-# ---------------------------------------------------------------------------
-# The AI is only ever sent this many characters, so never hold more than
-# slightly above it in memory (prevents out-of-memory on huge workbooks).
-MAX_EXTRACT_CHARS = 45000
-
-
 def extract_text_from_file(filename, file_bytes):
-    """Return the text content of an uploaded file, based on its type.
-    Memory-frugal: stops reading once MAX_EXTRACT_CHARS is reached."""
     name = filename.lower()
 
     if name.endswith((".xlsx", ".xlsm")):
@@ -75,7 +116,7 @@ def extract_text_from_file(filename, file_bytes):
                     text_parts.append("\n[... file is large; remaining sheets not "
                                       "included in this review pass ...]")
                     break
-                header = f"\n===== SHEET: {sheet.title} ====="
+                header = "\n===== SHEET: " + str(sheet.title) + " ====="
                 text_parts.append(header)
                 total += len(header)
                 for row in sheet.iter_rows(values_only=True):
@@ -93,8 +134,7 @@ def extract_text_from_file(filename, file_bytes):
 
     elif name.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(file_bytes))
-        parts = []
-        total = 0
+        parts, total = [], 0
         for p in doc.paragraphs:
             if p.text.strip():
                 parts.append(p.text)
@@ -106,8 +146,7 @@ def extract_text_from_file(filename, file_bytes):
 
     elif name.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(file_bytes))
-        parts = []
-        total = 0
+        parts, total = [], 0
         for page in reader.pages:
             t = page.extract_text() or ""
             parts.append(t)
@@ -120,21 +159,17 @@ def extract_text_from_file(filename, file_bytes):
     elif name.endswith((".csv", ".txt")):
         return file_bytes.decode("utf-8", errors="ignore")[:MAX_EXTRACT_CHARS]
 
-    else:
-        return None  # unsupported type
+    return None
 
 
-# ---------------------------------------------------------------------------
-# STEP 2: The instructions that turn raw DeepSeek into an audit reviewer
-# ---------------------------------------------------------------------------
 REVIEWER_INSTRUCTIONS = """You are an experienced audit reviewer at an accounting firm, reviewing audit working papers to the standard expected in an ICAP Quality Control Review or an Audit Oversight Board inspection.
 
 You will be given the text extracted from an audit working paper (often a revenue or other head, sometimes with supporting figures and calculations).
 
 Review it carefully and identify EVERY discrepancy, error, omission, weakness, or matter needing attention. Look specifically for:
 - Figures or totals that do not add up, or that do not agree between different parts of the document
-- Broken spreadsheet values such as #REF!, #DIV/0!, #VALUE! — these are hard errors
-- Content that appears to belong to a DIFFERENT client or engagement (wrong client name, another file reference left in from a reused template) — copy-paste contamination
+- Broken spreadsheet values such as #REF!, #DIV/0!, #VALUE! - these are hard errors
+- Content that appears to belong to a DIFFERENT client or engagement (wrong client name, another file reference left in from a reused template) - copy-paste contamination
 - Conclusions that are pre-filled or boilerplate ("satisfactory", "fairly stated") without evidence that actual work supports them
 - Missing sign-offs, missing dates, or dates out of logical sequence
 - Vague or unquantified work (e.g. a "sample" with no number of items tested)
@@ -144,14 +179,14 @@ Review it carefully and identify EVERY discrepancy, error, omission, weakness, o
 
 For EACH issue you find, give:
 1. A short, clear title of the issue
-2. A plain-English explanation (simple language a junior staff member can understand — avoid unnecessary jargon)
-3. The applicable standard or rule reference where you are reasonably confident (e.g. IFRS 15, IAS 24, IAS 1, ISA 500, ISA 230, Companies Act 2017). If you are NOT sure of the exact reference, say "reference to be confirmed" rather than inventing one.
+2. A plain-English explanation (simple language a junior staff member can understand - avoid unnecessary jargon)
+3. The applicable standard or rule reference
 4. A severity: High, Medium, or Low (or "Factual" for arithmetic/broken-value errors that are simply right or wrong)
-5. A suggested fix — what the team should do to resolve it
+5. A suggested fix - what the team should do to resolve it
 
 IMPORTANT RULES:
-- You are given the FIRM'S STANDARDS LIBRARY below. Base every standard reference on that library. When your finding is supported by the library, cite it (e.g. "IFRS 15 — control transfer (per firm standards library)").
-- If an issue is real but the library does not cover it, still raise it, but mark the reference as "outside loaded library — reference to be confirmed".
+- You are given the FIRM'S STANDARDS LIBRARY below. Base every standard reference on that library. When your finding is supported by the library, cite it (e.g. "IFRS 15 - control transfer (per firm standards library)").
+- If an issue is real but the library does not cover it, still raise it, but mark the reference as "outside loaded library - reference to be confirmed".
 - Never invent a standard, paragraph number, or fact. If unsure, say so.
 - Write everything in easy-to-understand English.
 - Base your findings on what is actually in the document provided, not assumptions.
@@ -173,19 +208,16 @@ Return ONLY the JSON, no other text."""
 
 
 def review_with_ai(document_text):
-    """Send the document to DeepSeek with the reviewer instructions, get findings back."""
-    # Keep the input to a sensible size (very large files get trimmed for this stage)
-    trimmed = document_text[:40000]
-
+    trimmed = document_text[:MAX_EXTRACT_CHARS]
     response = client.chat.completions.create(
         model="deepseek-chat",
         messages=[
             {"role": "system", "content": REVIEWER_INSTRUCTIONS},
-            {"role": "system", "content": f"FIRM'S STANDARDS LIBRARY (check against these texts):\n\n{KNOWLEDGE_BASE}"},
-            {"role": "user", "content": f"Here is the working paper to review:\n\n{trimmed}"},
+            {"role": "system", "content": "FIRM'S STANDARDS LIBRARY (check against these texts):\n\n" + KNOWLEDGE_BASE},
+            {"role": "user", "content": "Here is the working paper to review:\n\n" + trimmed},
         ],
-        max_tokens=3000,
-        temperature=0.2,  # low = more consistent, less "creative"
+        max_tokens=6000,
+        temperature=0.2,
     )
     raw = response.choices[0].message.content.strip()
     return parse_ai_json(raw)
@@ -196,7 +228,6 @@ def parse_ai_json(raw):
     import re as _re
     text = raw.strip()
 
-    # 1) Strip ```json fences if present
     if text.startswith("```"):
         parts = text.split("```")
         if len(parts) >= 2:
@@ -205,20 +236,16 @@ def parse_ai_json(raw):
             text = text.lstrip()[4:]
         text = text.strip()
 
-    # 2) If there's chatter before/after, cut to the outermost { ... }
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
         text = text[start:end + 1]
 
-    # 3) First attempt: parse as-is
     try:
         return json.loads(text), None
     except Exception:
         pass
 
-    # 4) Second attempt: fix the most common quirks
-    #    smart quotes -> normal quotes; remove trailing commas before } or ]
     cleaned = (text
                .replace("\u201c", '"').replace("\u201d", '"')
                .replace("\u2018", "'").replace("\u2019", "'"))
@@ -228,8 +255,6 @@ def parse_ai_json(raw):
     except Exception:
         pass
 
-    # 5) Last resort: the response was cut off mid-way. Salvage the complete
-    #    findings by extracting every complete {...} object inside "findings".
     try:
         objs = []
         depth = 0
@@ -253,7 +278,7 @@ def parse_ai_json(raw):
                         try:
                             objs.append(json.loads(buf))
                         except Exception:
-                            pass  # skip the incomplete/broken one
+                            pass
                         buf = ""
                 if ch == "]" and depth == 0:
                     break
@@ -265,145 +290,378 @@ def parse_ai_json(raw):
         pass
 
     return None, ("The AI's response could not be read as structured findings. "
-                  f"Raw response:\n\n{raw}")
+                  "Raw response:\n\n" + raw)
 
 
-# ---------------------------------------------------------------------------
-# STEP 3: The web page
-# ---------------------------------------------------------------------------
-PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
+def save_results(batch):
+    rid = uuid.uuid4().hex[:12]
+    with open(os.path.join(RESULTS_DIR, rid + ".json"), "w", encoding="utf-8") as f:
+        json.dump(batch, f)
+    return rid
+
+
+def load_results(rid):
+    safe = "".join(c for c in rid if c.isalnum())
+    path = os.path.join(RESULTS_DIR, safe + ".json")
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+DISCLAIMER = ("This review has been prepared by an AI-assisted tool to support the audit "
+              "review process by identifying possible discrepancies, errors, omissions, and "
+              "matters requiring attention. It does not replace the judgement of the engagement "
+              "team. All findings are observations for consideration, not conclusions. Every "
+              "point should be reviewed, verified, and decided upon by a qualified member of "
+              "the audit team. Final responsibility for the audit - including all professional "
+              "judgements, the sufficiency of audit evidence, and the audit opinion - rests "
+              "entirely with the Engagement Partner and the audit team, not with this tool. "
+              "The AI does not sign off, approve, or conclude on any matter.")
+
+
+def build_excel(batch):
+    from openpyxl.styles import Font
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Review Points"
+    ws.append(["File", "No.", "Title", "Severity", "Explanation",
+               "Reference", "Suggested fix"])
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for item in batch["files"]:
+        fname = item["filename"]
+        if item.get("error"):
+            ws.append([fname, "-", "REVIEW ERROR", "-", item["error"], "-", "-"])
+            continue
+        for i, f in enumerate(item["result"].get("findings", []), start=1):
+            ws.append([fname, i, f.get("title", ""), f.get("severity", ""),
+                       f.get("explanation", ""), f.get("reference", ""),
+                       f.get("fix", "")])
+    ws.append([])
+    ws.append(["Professional judgement statement:"])
+    ws.append([DISCLAIMER])
+    widths = [28, 5, 34, 10, 60, 40, 50]
+    for idx, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + idx)].width = w
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def build_pdf(batch):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=1.6 * cm, rightMargin=1.6 * cm,
+                            topMargin=1.6 * cm, bottomMargin=1.6 * cm)
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1x", parent=styles["Heading1"], fontSize=15)
+    h2 = ParagraphStyle("h2x", parent=styles["Heading2"], fontSize=12,
+                        textColor=colors.HexColor("#0B7C7C"))
+    body = ParagraphStyle("bodyx", parent=styles["BodyText"], fontSize=9.5, leading=13)
+    small = ParagraphStyle("smallx", parent=styles["BodyText"], fontSize=8,
+                           leading=11, textColor=colors.HexColor("#5A4A28"))
+
+    sev_color = {"High": "#B23A2E", "Medium": "#B0791C",
+                 "Low": "#5B7083", "Factual": "#14233B"}
+
+    story = [Paragraph("Baker Tilly - AI Audit Reviewer: Review Points", h1),
+             Spacer(1, 8)]
+    for item in batch["files"]:
+        story.append(Paragraph("File: " + item["filename"], h2))
+        if item.get("error"):
+            story.append(Paragraph("Review error: " + item["error"], body))
+            story.append(Spacer(1, 8))
+            continue
+        result = item["result"]
+        if result.get("summary"):
+            story.append(Paragraph("<b>Overall:</b> " + result["summary"], body))
+            story.append(Spacer(1, 6))
+        for i, f in enumerate(result.get("findings", []), start=1):
+            colr = sev_color.get(f.get("severity", ""), "#14233B")
+            story.append(Paragraph(
+                "<b>" + str(i) + ". " + f.get("title", "") + "</b> "
+                "<font color='" + colr + "'>[" + f.get("severity", "") + "]</font>", body))
+            story.append(Paragraph(f.get("explanation", ""), body))
+            if f.get("reference"):
+                story.append(Paragraph("<i>Reference: " + f["reference"] + "</i>", body))
+            story.append(Paragraph("<b>Suggested fix:</b> " + f.get("fix", ""), body))
+            story.append(Spacer(1, 7))
+        story.append(Spacer(1, 10))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("<b>Professional judgement statement</b>", body))
+    story.append(Paragraph(DISCLAIMER, small))
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+
+LOGIN_PAGE = """
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Baker Tilly — AI Audit Reviewer</title>
+<title>Baker Tilly - AI Audit Reviewer : Sign in</title>
 <style>
-  body { font-family:-apple-system,Segoe UI,Roboto,sans-serif; background:#ECEEF0; margin:0; padding:32px; color:#14233B; }
-  .wrap { max-width:900px; margin:0 auto; }
-  .head { display:flex; align-items:center; gap:14px; margin-bottom:8px; }
-  .logo { width:42px; height:42px; border-radius:50%; background:radial-gradient(circle at 32% 30%, #2FD6D0, #0B7C7C); }
-  h1 { font-size:21px; margin:0; }
-  .sub { color:#5B7083; font-size:13px; margin-bottom:24px; }
-  .card { background:#fff; border:1px solid #D9DDE1; border-radius:12px; padding:26px; box-shadow:0 2px 12px rgba(20,35,59,.06); margin-bottom:20px; }
-  .drop { border:2px dashed #B7BFC6; border-radius:10px; padding:30px; text-align:center; }
-  input[type=file] { margin:12px 0; font-size:14px; }
-  button { background:#0B7C7C; color:#fff; border:none; padding:12px 24px; border-radius:8px; font-size:14px; font-weight:600; cursor:pointer; }
-  button:hover { background:#0A6E6E; }
-  .notice { background:#F3ECDB; color:#5A4A28; font-size:12.5px; padding:9px 14px; border-radius:8px; margin-bottom:20px; }
-  .summary { background:#EFF5F5; border:1px solid #D9DDE1; border-radius:8px; padding:14px 16px; margin-bottom:18px; font-size:14px; }
-  .finding { border:1px solid #D9DDE1; border-radius:8px; margin-bottom:14px; overflow:hidden; }
-  .bar { height:4px; }
-  .bar.High{background:#B23A2E;} .bar.Medium{background:#B0791C;} .bar.Low{background:#5B7083;} .bar.Factual{background:#14233B;}
-  .fbody { padding:14px 16px; }
-  .ftop { display:flex; align-items:center; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
-  .sev { font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:10px; }
-  .sev.High{background:#F5E1DE;color:#B23A2E;} .sev.Medium{background:#F3EAD3;color:#B0791C;}
-  .sev.Low{background:#EAECEE;color:#5B7083;} .sev.Factual{background:#E4E7EB;color:#14233B;}
-  .ftitle { font-weight:600; font-size:15px; }
-  .fexpl { font-size:13.5px; color:#3A4A64; margin-bottom:8px; }
-  .ref { font-family:ui-monospace,Menlo,monospace; font-size:11.5px; background:#F0F5F5; color:#0B7C7C; padding:5px 9px; border-radius:4px; border-left:3px solid #0EA5A5; margin-bottom:8px; display:inline-block; }
-  .fix { font-size:12.5px; color:#3A4A64; background:#F7F9F9; border:1px solid #eee; border-radius:6px; padding:8px 10px; }
-  .fix b{color:#14233B;}
-  .disclaimer { margin-top:22px; padding:16px; background:#FBF6EE; border:1px solid #E8D9BE; border-radius:8px; font-size:12.5px; color:#5A4A28; line-height:1.6; }
-  .err { background:#FBEAE8; border:1px solid #E4B4AD; color:#B23A2E; padding:14px; border-radius:8px; font-size:13px; white-space:pre-wrap; }
-  .spin { display:inline-block; }
-</style>
-</head>
-<body>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#ECEEF0;margin:0;
+      min-height:100vh;display:grid;place-items:center;color:#14233B;}
+ .card{background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:36px 32px;
+       width:100%;max-width:380px;box-shadow:0 4px 24px rgba(20,35,59,.08);text-align:center;}
+ .logo{width:46px;height:46px;border-radius:50%;
+       background:radial-gradient(circle at 32% 30%,#2FD6D0,#0B7C7C);margin:0 auto 14px;}
+ h1{font-size:20px;margin:0 0 4px;} .sub{font-size:13px;color:#5B7083;margin-bottom:24px;}
+ label{display:block;text-align:left;font-size:12px;font-weight:600;color:#3A4A64;margin:10px 0 5px;}
+ input{width:100%;box-sizing:border-box;padding:11px 13px;border:1px solid #B7BFC6;
+       border-radius:6px;font-size:14px;}
+ button{width:100%;padding:12px;background:#0B7C7C;color:#fff;border:none;border-radius:6px;
+        font-size:14px;font-weight:600;cursor:pointer;margin-top:16px;}
+ .err{color:#B23A2E;font-size:12.5px;min-height:16px;text-align:left;margin-top:8px;}
+</style></head><body>
+<div class="card">
+ <div class="logo"></div>
+ <h1>AI Audit Reviewer</h1>
+ <div class="sub">Baker Tilly - Authorised users only</div>
+ <form method="POST">
+  <label>Username</label><input name="username" autocomplete="username" required>
+  <label>Password</label><input type="password" name="password" autocomplete="current-password" required>
+  <div class="err">{{ error or "" }}</div>
+  <button type="submit">Sign in</button>
+ </form>
+</div></body></html>
+"""
+
+MAIN_PAGE = """
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Baker Tilly - AI Audit Reviewer</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#ECEEF0;margin:0;
+      padding:28px;color:#14233B;}
+ .wrap{max-width:920px;margin:0 auto;}
+ .top{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:6px;}
+ .brand{display:flex;align-items:center;gap:12px;}
+ .logo{width:40px;height:40px;border-radius:50%;
+       background:radial-gradient(circle at 32% 30%,#2FD6D0,#0B7C7C);}
+ h1{font-size:20px;margin:0;} .sub{color:#5B7083;font-size:13px;margin-bottom:18px;}
+ .who{font-size:12.5px;color:#3A4A64;} .who b{color:#14233B;}
+ .who a{color:#0B7C7C;margin-left:10px;}
+ .card{background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:24px;
+       box-shadow:0 2px 12px rgba(20,35,59,.06);margin-bottom:18px;}
+ .notice{background:#F3ECDB;color:#5A4A28;font-size:12.5px;padding:9px 14px;border-radius:8px;margin-bottom:16px;}
+ .drop{border:2px dashed #B7BFC6;border-radius:10px;padding:28px;text-align:center;transition:.15s;}
+ .drop.over{border-color:#0EA5A5;background:#F1FAFA;}
+ .drop .big{font-weight:600;margin-bottom:4px;}
+ .drop .small{font-size:12.5px;color:#5B7083;margin-bottom:10px;}
+ .filelist{font-size:12.5px;color:#3A4A64;margin-top:10px;text-align:left;display:inline-block;}
+ button.go{background:#0B7C7C;color:#fff;border:none;padding:12px 24px;border-radius:8px;
+        font-size:14px;font-weight:600;cursor:pointer;margin-top:12px;}
+ .browse{display:inline-block;background:#EAF6F6;color:#0B7C7C;padding:9px 16px;border-radius:6px;
+        font-weight:600;font-size:13px;cursor:pointer;}
+ input[type=file]{display:none;}
+ .filehead{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#5B7083;margin:20px 0 8px;}
+ .summary{background:#EFF5F5;border:1px solid #D9DDE1;border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:13.5px;}
+ .finding{border:1px solid #D9DDE1;border-radius:8px;margin-bottom:12px;overflow:hidden;}
+ .bar{height:4px;} .bar.High{background:#B23A2E;} .bar.Medium{background:#B0791C;}
+ .bar.Low{background:#5B7083;} .bar.Factual{background:#14233B;}
+ .fbody{padding:13px 15px;}
+ .ftop{display:flex;align-items:center;gap:8px;margin-bottom:7px;flex-wrap:wrap;}
+ .sev{font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:10px;}
+ .sev.High{background:#F5E1DE;color:#B23A2E;} .sev.Medium{background:#F3EAD3;color:#B0791C;}
+ .sev.Low{background:#EAECEE;color:#5B7083;} .sev.Factual{background:#E4E7EB;color:#14233B;}
+ .ftitle{font-weight:600;font-size:14.5px;}
+ .fexpl{font-size:13px;color:#3A4A64;margin-bottom:8px;}
+ .ref{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#F0F5F5;color:#0B7C7C;
+      padding:5px 9px;border-radius:4px;border-left:3px solid #0EA5A5;margin-bottom:8px;display:inline-block;}
+ .fix{font-size:12.5px;color:#3A4A64;background:#F7F9F9;border:1px solid #eee;border-radius:6px;padding:8px 10px;}
+ .fix b{color:#14233B;}
+ .dl{display:flex;gap:10px;margin:6px 0 14px;flex-wrap:wrap;}
+ .dl a{background:#14233B;color:#fff;text-decoration:none;padding:9px 16px;border-radius:6px;
+       font-size:13px;font-weight:600;}
+ .dl a.x{background:#1F6B4F;}
+ .disclaimer{margin-top:18px;padding:14px;background:#FBF6EE;border:1px solid #E8D9BE;border-radius:8px;
+       font-size:12px;color:#5A4A28;line-height:1.55;}
+ .err{background:#FBEAE8;border:1px solid #E4B4AD;color:#B23A2E;padding:13px;border-radius:8px;
+       font-size:13px;white-space:pre-wrap;margin-bottom:12px;}
+ .wait{font-size:12.5px;color:#5B7083;margin-top:8px;}
+</style></head><body>
 <div class="wrap">
-  <div class="head">
-    <div class="logo"></div>
-    <div><h1>AI Audit Reviewer</h1></div>
-  </div>
-  <div class="sub">Baker Tilly · Revenue &amp; working-paper review (Stage 1)</div>
+ <div class="top">
+  <div class="brand"><div class="logo"></div><h1>AI Audit Reviewer</h1></div>
+  <div class="who">Signed in as <b>{{ user }}</b> ({{ 'Full access' if role=='full' else 'Limited access' }})
+   <a href="{{ url_for('logout') }}">Log out</a></div>
+ </div>
+ <div class="sub">Baker Tilly - Working-paper review - Stage 3</div>
 
-  <div class="notice"><b>Note:</b> This build reviews against the firm's loaded standards library (summaries of IFRS 15, IAS 24, IAS 1, ISA 230, ISA 500 and related requirements). Official full texts can replace the summaries at any time without code changes. Use sample / public data until the tool moves to the firm's own server.</div>
+ <div class="notice"><b>Note:</b> Reviews are checked against the firm's loaded standards library. Use sample / public data until the tool moves to the firm's own server. Up to {{ maxfiles }} files per batch.</div>
 
+ <div class="card">
+  <form method="POST" enctype="multipart/form-data" id="upform">
+   <div class="drop" id="drop">
+    <div class="big">Drag &amp; drop working papers here</div>
+    <div class="small">Excel (.xlsx), Word (.docx), PDF, or CSV - up to {{ maxfiles }} files</div>
+    <label class="browse">Browse files<input type="file" id="fileinput" name="files" multiple
+      accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt"></label>
+    <div class="filelist" id="filelist"></div>
+   </div>
+   <div style="text-align:center;">
+     <button class="go" type="submit">Review selected files</button>
+     <div class="wait">Reviews take 1-3 minutes per file. Please leave the page open and wait.</div>
+   </div>
+  </form>
+ </div>
+
+ {% if error %}<div class="err">{{ error }}</div>{% endif %}
+
+ {% if batch %}
   <div class="card">
-    <form method="POST" enctype="multipart/form-data">
-      <div class="drop">
-        <div style="font-weight:600; margin-bottom:6px;">Upload a working paper to review</div>
-        <div style="font-size:12.5px; color:#5B7083;">Excel (.xlsx), Word (.docx), PDF, or CSV</div>
-        <input type="file" name="file" accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt" required>
-        <br>
-        <button type="submit">Review this file</button>
-      </div>
-    </form>
-  </div>
-
-  {% if error %}
-    <div class="card"><div class="err">{{ error }}</div></div>
-  {% endif %}
-
-  {% if result %}
-    <div class="card">
-      <h2 style="font-size:17px; margin:0 0 12px;">Review Points — {{ filename }}</h2>
-      {% if result.summary %}
-        <div class="summary"><b>Overall:</b> {{ result.summary }}</div>
-      {% endif %}
-
-      {% for f in result.findings %}
+   <h2 style="font-size:17px;margin:0 0 10px;">Review Points</h2>
+   {% if role == 'full' %}
+   <div class="dl">
+     <a class="x" href="{{ url_for('download_excel', rid=batch_id) }}">Download Excel</a>
+     <a href="{{ url_for('download_pdf', rid=batch_id) }}">Download PDF</a>
+   </div>
+   {% endif %}
+   {% for item in batch['files'] %}
+     <div class="filehead">FILE: {{ item['filename'] }}</div>
+     {% if item.get('error') %}
+       <div class="err">{{ item['error'] }}</div>
+     {% else %}
+       {% if item['result'].get('summary') %}
+         <div class="summary"><b>Overall:</b> {{ item['result']['summary'] }}</div>
+       {% endif %}
+       {% for f in item['result'].get('findings', []) %}
         <div class="finding">
-          <div class="bar {{ f.severity }}"></div>
-          <div class="fbody">
-            <div class="ftop">
-              <span class="ftitle">{{ f.title }}</span>
-              <span class="sev {{ f.severity }}">{{ f.severity }}</span>
-            </div>
-            <div class="fexpl">{{ f.explanation }}</div>
-            {% if f.reference %}<div class="ref">{{ f.reference }}</div>{% endif %}
-            <div class="fix"><b>Suggested fix:</b> {{ f.fix }}</div>
-          </div>
+         <div class="bar {{ f.get('severity','Low') }}"></div>
+         <div class="fbody">
+          <div class="ftop"><span class="ftitle">{{ f.get('title','') }}</span>
+            <span class="sev {{ f.get('severity','Low') }}">{{ f.get('severity','') }}</span></div>
+          <div class="fexpl">{{ f.get('explanation','') }}</div>
+          {% if f.get('reference') %}<div class="ref">{{ f['reference'] }}</div>{% endif %}
+          <div class="fix"><b>Suggested fix:</b> {{ f.get('fix','') }}</div>
+         </div>
         </div>
-      {% endfor %}
-
-      <div class="disclaimer">
-        <b>Professional judgement statement:</b> This review has been prepared by an AI-assisted tool to support the audit review process by identifying possible discrepancies, errors, omissions, and matters requiring attention. It does not replace the judgement of the engagement team. All findings above are observations for your consideration, not conclusions. Every point should be reviewed, verified, and decided upon by a qualified member of the audit team. Final responsibility for the audit — including all professional judgements, the sufficiency of audit evidence, and the audit opinion — rests entirely with the Engagement Partner and the audit team, not with this tool. The AI does not sign off, approve, or conclude on any matter.
-      </div>
-    </div>
-  {% endif %}
+       {% endfor %}
+     {% endif %}
+   {% endfor %}
+   <div class="disclaimer"><b>Professional judgement statement:</b> {{ disclaimer }}</div>
+  </div>
+ {% endif %}
 </div>
-</body>
-</html>
+
+<script>
+const drop = document.getElementById('drop');
+const input = document.getElementById('fileinput');
+const list = document.getElementById('filelist');
+const MAXF = {{ maxfiles }};
+
+function showFiles(files){
+  if(!files || files.length===0){ list.innerHTML=''; return; }
+  let html = '';
+  const n = Math.min(files.length, MAXF);
+  for(let i=0;i<n;i++){ html += '&#128196; ' + files[i].name + '<br>'; }
+  if(files.length > MAXF){ html += '<i>(only the first ' + MAXF + ' will be reviewed)</i>'; }
+  list.innerHTML = html;
+}
+input.addEventListener('change', () => showFiles(input.files));
+['dragover','dragenter'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => {
+  if(e.dataTransfer.files.length){ input.files = e.dataTransfer.files; showFiles(input.files); }
+});
+</script>
+</body></html>
 """
 
 
-@app.route("/", methods=["GET", "POST"])
-def home():
-    result = None
+@app.route("/login", methods=["GET", "POST"])
+def login():
     error = None
-    filename = None
+    if request.method == "POST":
+        users = load_users()
+        name = request.form.get("username", "").strip()
+        pw = request.form.get("password", "")
+        u = users.get(name)
+        if u and u["password"] == pw:
+            session["user"] = name
+            session["role"] = u["role"]
+            return redirect(url_for("home"))
+        error = "Incorrect username or password."
+    return render_template_string(LOGIN_PAGE, error=error)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/", methods=["GET", "POST"])
+@login_required
+def home():
+    error = None
+    batch = None
+    batch_id = None
 
     if request.method == "POST":
         if not DEEPSEEK_API_KEY:
             error = "The DeepSeek API key is not set. Add it in Render's Environment Variables."
-            return render_template_string(PAGE, result=None, error=error, filename=None)
-
-        uploaded = request.files.get("file")
-        if not uploaded or uploaded.filename == "":
-            error = "Please choose a file first."
-            return render_template_string(PAGE, result=None, error=error, filename=None)
-
-        filename = uploaded.filename
-        file_bytes = uploaded.read()
-
-        try:
-            text = extract_text_from_file(filename, file_bytes)
-        except Exception as e:
-            error = f"Could not read the file. Details: {e}"
-            return render_template_string(PAGE, result=None, error=error, filename=filename)
-
-        if text is None:
-            error = "Unsupported file type. Please upload Excel, Word, PDF, or CSV."
-        elif text.strip() == "":
-            error = "The file appears to be empty, or its text could not be read (a scanned PDF with no text layer, perhaps)."
         else:
-            result, ai_error = review_with_ai(text)
-            if ai_error:
-                error = ai_error
+            uploads = [f for f in request.files.getlist("files") if f and f.filename]
+            if not uploads:
+                error = "Please choose at least one file."
+            else:
+                uploads = uploads[:MAX_FILES_PER_BATCH]
+                batch = {"files": []}
+                for up in uploads:
+                    entry = {"filename": up.filename}
+                    try:
+                        text = extract_text_from_file(up.filename, up.read())
+                        if text is None:
+                            entry["error"] = "Unsupported file type."
+                        elif not text.strip():
+                            entry["error"] = ("The file appears to be empty, or its text "
+                                              "could not be read (a scanned PDF with no "
+                                              "text layer, perhaps).")
+                        else:
+                            result, ai_err = review_with_ai(text)
+                            if ai_err:
+                                entry["error"] = ai_err
+                            else:
+                                entry["result"] = result
+                    except Exception as e:
+                        entry["error"] = "Could not process this file. Details: " + str(e)
+                    batch["files"].append(entry)
+                batch_id = save_results(batch)
 
-    return render_template_string(PAGE, result=result, error=error, filename=filename)
+    return render_template_string(MAIN_PAGE, user=session.get("user"),
+                                  role=session.get("role"), error=error,
+                                  batch=batch, batch_id=batch_id,
+                                  maxfiles=MAX_FILES_PER_BATCH,
+                                  disclaimer=DISCLAIMER)
+
+
+@app.route("/download/excel/<rid>")
+@full_access_required
+def download_excel(rid):
+    batch = load_results(rid)
+    if not batch:
+        return "This report has expired. Please run the review again.", 404
+    buf = build_excel(batch)
+    return send_file(buf, as_attachment=True,
+                     download_name="review_points.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument."
+                              "spreadsheetml.sheet")
+
+
+@app.route("/download/pdf/<rid>")
+@full_access_required
+def download_pdf(rid):
+    batch = load_results(rid)
+    if not batch:
+        return "This report has expired. Please run the review again.", 404
+    buf = build_pdf(batch)
+    return send_file(buf, as_attachment=True,
+                     download_name="review_points.pdf",
+                     mimetype="application/pdf")
 
 
 if __name__ == "__main__":
