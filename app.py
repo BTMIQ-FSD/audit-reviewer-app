@@ -26,7 +26,7 @@ from flask import (Flask, request, render_template_string, session,
                    redirect, url_for, send_file)
 from openai import OpenAI
 
-from openpyxl import load_workbook, Workbook
+from openpyxl import Workbook
 from docx import Document as DocxDocument
 from pypdf import PdfReader
 
@@ -103,34 +103,102 @@ def load_knowledge_base():
 KNOWLEDGE_BASE = load_knowledge_base()
 
 
+def _extract_xlsx_lightweight(file_bytes):
+    """Read sheet text straight from the xlsx internals (an xlsx is a zip of
+    XML files). This avoids openpyxl building the full workbook object —
+    external links, styles and structures are skipped entirely, keeping
+    memory tiny even for complex, heavily-linked audit workbooks."""
+    import zipfile
+    import re as _re
+    from xml.etree.ElementTree import iterparse
+
+    NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    text_parts = []
+    total = 0
+
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+        names = z.namelist()
+
+        # shared strings (xlsx stores text centrally)
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            with z.open("xl/sharedStrings.xml") as f:
+                for ev, el in iterparse(f, events=("end",)):
+                    if el.tag == NS + "si":
+                        texts = [t.text or "" for t in el.iter(NS + "t")]
+                        shared.append("".join(texts))
+                        el.clear()  # clear only completed string items
+
+        # sheet name map (falls back to file order if unavailable)
+        sheet_titles = {}
+        try:
+            if "xl/workbook.xml" in names:
+                with z.open("xl/workbook.xml") as f:
+                    idx = 0
+                    for ev, el in iterparse(f, events=("end",)):
+                        if el.tag == NS + "sheet":
+                            idx += 1
+                            sheet_titles[idx] = el.get("name", f"Sheet{idx}")
+                        el.clear()
+        except Exception:
+            pass
+
+        sheet_files = sorted(
+            n for n in names
+            if _re.match(r"xl/worksheets/sheet\d+\.xml$", n)
+        )
+        for snum, sname in enumerate(sheet_files, start=1):
+            if total >= MAX_EXTRACT_CHARS:
+                text_parts.append("\n[... file is large; remaining sheets not "
+                                  "included in this review pass ...]")
+                break
+            title = sheet_titles.get(snum, f"Sheet{snum}")
+            header = "\n===== SHEET: " + title + " ====="
+            text_parts.append(header)
+            total += len(header)
+
+            row_cells = []
+            with z.open(sname) as f:
+                for ev, el in iterparse(f, events=("end",)):
+                    tag = el.tag
+                    if tag == NS + "c":  # a cell
+                        ctype = el.get("t")
+                        v = el.find(NS + "v")
+                        val = None
+                        if ctype == "s" and v is not None:
+                            try:
+                                val = shared[int(v.text)]
+                            except Exception:
+                                val = v.text
+                        elif ctype == "inlineStr":
+                            is_el = el.find(NS + "is")
+                            if is_el is not None:
+                                t = is_el.find(NS + "t")
+                                val = t.text if t is not None else None
+                        elif ctype == "e" and v is not None:
+                            val = v.text  # keep #REF!, #VALUE! etc — we WANT these
+                        elif v is not None:
+                            val = v.text
+                        if val is not None and str(val).strip() != "":
+                            row_cells.append(str(val))
+                    elif tag == NS + "row":
+                        if row_cells:
+                            line = " | ".join(row_cells)
+                            text_parts.append(line)
+                            total += len(line)
+                        row_cells = []
+                        el.clear()  # safe to clear once the whole row is done
+                        if total >= MAX_EXTRACT_CHARS:
+                            break
+
+    return "\n".join(text_parts)
+
+
 def extract_text_from_file(filename, file_bytes):
     name = filename.lower()
 
     if name.endswith((".xlsx", ".xlsm")):
-        text_parts = []
-        total = 0
-        wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
-        try:
-            for sheet in wb.worksheets:
-                if total >= MAX_EXTRACT_CHARS:
-                    text_parts.append("\n[... file is large; remaining sheets not "
-                                      "included in this review pass ...]")
-                    break
-                header = "\n===== SHEET: " + str(sheet.title) + " ====="
-                text_parts.append(header)
-                total += len(header)
-                for row in sheet.iter_rows(values_only=True):
-                    cells = [str(c) for c in row
-                             if c is not None and str(c).strip() != ""]
-                    if cells:
-                        line = " | ".join(cells)
-                        text_parts.append(line)
-                        total += len(line)
-                        if total >= MAX_EXTRACT_CHARS:
-                            break
-        finally:
-            wb.close()
-        return "\n".join(text_parts)
+        return _extract_xlsx_lightweight(file_bytes)
 
     elif name.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(file_bytes))
@@ -611,10 +679,13 @@ def home():
             else:
                 uploads = uploads[:MAX_FILES_PER_BATCH]
                 batch = {"files": []}
+                import gc
                 for up in uploads:
                     entry = {"filename": up.filename}
                     try:
-                        text = extract_text_from_file(up.filename, up.read())
+                        data = up.read()
+                        text = extract_text_from_file(up.filename, data)
+                        del data  # release the raw file bytes immediately
                         if text is None:
                             entry["error"] = "Unsupported file type."
                         elif not text.strip():
@@ -623,6 +694,7 @@ def home():
                                               "text layer, perhaps).")
                         else:
                             result, ai_err = review_with_ai(text)
+                            del text  # release the extracted text
                             if ai_err:
                                 entry["error"] = ai_err
                             else:
@@ -630,6 +702,7 @@ def home():
                     except Exception as e:
                         entry["error"] = "Could not process this file. Details: " + str(e)
                     batch["files"].append(entry)
+                    gc.collect()  # reclaim memory before the next file
                 batch_id = save_results(batch)
 
     return render_template_string(MAIN_PAGE, user=session.get("user"),
