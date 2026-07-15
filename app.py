@@ -37,13 +37,44 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib import colors
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB per upload batch
+UPLOAD_LIMIT_MB = 50
+app.config["MAX_CONTENT_LENGTH"] = UPLOAD_LIMIT_MB * 1024 * 1024
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-set-SECRET-KEY-env-var")
+
+
+@app.errorhandler(413)
+def too_large(e):
+    """Friendly message instead of a crash page when the upload is too big."""
+    msg = (f"Your upload is too large. The limit is {UPLOAD_LIMIT_MB} MB per batch "
+           f"on this hosting. Please upload fewer or smaller files, or split the "
+           f"batch. (Unlimited sizes become possible once the tool moves to the "
+           f"firm's own server.)")
+    return render_template_string(MAIN_PAGE, user=session.get("user", ""),
+                                  role=session.get("role", "limited"), error=msg,
+                                  batch=None, batch_id=None,
+                                  maxfiles=MAX_FILES_PER_BATCH,
+                                  disclaimer=DISCLAIMER), 413
+
+
+@app.errorhandler(500)
+def server_error(e):
+    """Friendly message instead of the bare 'Internal Server Error' page."""
+    msg = ("Something went wrong while processing your request. Please try again "
+           "with fewer or smaller files. If it keeps happening, note what you "
+           "uploaded and report it.")
+    try:
+        return render_template_string(MAIN_PAGE, user=session.get("user", ""),
+                                      role=session.get("role", "limited"), error=msg,
+                                      batch=None, batch_id=None,
+                                      maxfiles=MAX_FILES_PER_BATCH,
+                                      disclaimer=DISCLAIMER), 500
+    except Exception:
+        return msg, 500
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-MAX_FILES_PER_BATCH = 3
+MAX_FILES_PER_BATCH = 8
 MAX_EXTRACT_CHARS = 45000
 RESULTS_DIR = os.path.join(tempfile.gettempdir(), "audit_results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -270,7 +301,8 @@ Return your answer as a JSON object with this exact structure:
       "fix": "..."
     }
   ],
-  "summary": "A one or two sentence overall summary of the file's condition."
+  "summary": "A one or two sentence overall summary of the file's condition.",
+  "conclusion": "A 2-4 sentence head-wise conclusion in plain English: the overall condition of this working paper, whether its documented conclusions can currently be relied on, and what must be fixed first."
 }
 Return ONLY the JSON, no other text."""
 
@@ -289,6 +321,58 @@ def review_with_ai(document_text):
     )
     raw = response.choices[0].message.content.strip()
     return parse_ai_json(raw)
+
+
+
+
+BATCH_INSTRUCTIONS = """You are an experienced audit reviewer. You are given the review results for a BATCH of related audit files (working papers and possibly their supporting evidence such as confirmations, invoices, schedules).
+
+Produce:
+1. "overall_conclusion": a plain-English batch conclusion (3-5 sentences): the overall condition across the files, the weakest areas, and what the team should fix first.
+2. "common_themes": a list of short strings - recurring problems appearing across multiple files (e.g. "Sign-offs missing in 4 of 6 files").
+3. "cross_file_observations": a list of short strings - inconsistencies or corroboration issues BETWEEN the files (e.g. a figure in one file not agreeing with the supporting document in another, or a working paper claiming evidence that the attached evidence does not show). If none can be determined, return an empty list.
+
+Base everything only on the material provided. Never invent facts or references. Plain English.
+Return ONLY a JSON object: {"overall_conclusion": "...", "common_themes": [...], "cross_file_observations": [...]}"""
+
+
+def batch_conclusion_with_ai(batch):
+    """One extra AI pass across the whole batch: overall conclusion, themes,
+    and cross-file (evidence corroboration) observations."""
+    parts = []
+    for item in batch["files"]:
+        parts.append("FILE: " + item["filename"])
+        if item.get("error"):
+            parts.append("  (could not be reviewed: " + item["error"][:200] + ")")
+            continue
+        res = item.get("result", {})
+        if res.get("summary"):
+            parts.append("  Summary: " + res["summary"])
+        for f in res.get("findings", [])[:12]:
+            parts.append("  - [" + f.get("severity", "") + "] " + f.get("title", "")
+                         + ": " + f.get("explanation", "")[:200])
+        excerpt = (item.get("excerpt") or "")[:3000]
+        if excerpt:
+            parts.append("  EXCERPT OF FILE CONTENT:\n" + excerpt)
+    material = "\n".join(parts)[:30000]
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": BATCH_INSTRUCTIONS},
+                {"role": "user", "content": material},
+            ],
+            max_tokens=1500,
+            temperature=0.2,
+        )
+        raw = response.choices[0].message.content.strip()
+        parsed, err = parse_ai_json(raw)
+        if parsed and "overall_conclusion" in str(parsed):
+            return parsed
+    except Exception:
+        pass
+    return None
 
 
 def parse_ai_json(raw):
@@ -397,11 +481,22 @@ def build_excel(batch):
                "Reference", "Suggested fix"])
     for c in ws[1]:
         c.font = Font(bold=True)
+    if batch.get("overall"):
+        ws.append(["BATCH", "-", "OVERALL CONCLUSION", "-",
+                   batch["overall"].get("overall_conclusion", ""), "", ""])
+        for t in batch["overall"].get("common_themes", []):
+            ws.append(["BATCH", "-", "Common theme", "-", t, "", ""])
+        for t in batch["overall"].get("cross_file_observations", []):
+            ws.append(["BATCH", "-", "Cross-file observation", "-", t, "", ""])
+        ws.append([])
     for item in batch["files"]:
         fname = item["filename"]
         if item.get("error"):
             ws.append([fname, "-", "REVIEW ERROR", "-", item["error"], "-", "-"])
             continue
+        if item.get("result", {}).get("conclusion"):
+            ws.append([fname, "-", "HEAD-WISE CONCLUSION", "-",
+                       item["result"]["conclusion"], "", ""])
         for i, f in enumerate(item["result"].get("findings", []), start=1):
             ws.append([fname, i, f.get("title", ""), f.get("severity", ""),
                        f.get("explanation", ""), f.get("reference", ""),
@@ -426,16 +521,24 @@ def build_pdf(batch):
     styles = getSampleStyleSheet()
     h1 = ParagraphStyle("h1x", parent=styles["Heading1"], fontSize=15)
     h2 = ParagraphStyle("h2x", parent=styles["Heading2"], fontSize=12,
-                        textColor=colors.HexColor("#0B7C7C"))
+                        textColor=colors.HexColor("#00A09B"))
     body = ParagraphStyle("bodyx", parent=styles["BodyText"], fontSize=9.5, leading=13)
     small = ParagraphStyle("smallx", parent=styles["BodyText"], fontSize=8,
                            leading=11, textColor=colors.HexColor("#5A4A28"))
 
     sev_color = {"High": "#B23A2E", "Medium": "#B0791C",
-                 "Low": "#5B7083", "Factual": "#14233B"}
+                 "Low": "#5B7083", "Factual": "#002B49"}
 
     story = [Paragraph("Baker Tilly - AI Audit Reviewer: Review Points", h1),
              Spacer(1, 8)]
+    if batch.get("overall"):
+        story.append(Paragraph("Overall batch conclusion", h2))
+        story.append(Paragraph(batch["overall"].get("overall_conclusion", ""), body))
+        for t in batch["overall"].get("common_themes", []):
+            story.append(Paragraph("- " + t, body))
+        for t in batch["overall"].get("cross_file_observations", []):
+            story.append(Paragraph("- (cross-file) " + t, body))
+        story.append(Spacer(1, 10))
     for item in batch["files"]:
         story.append(Paragraph("File: " + item["filename"], h2))
         if item.get("error"):
@@ -446,8 +549,11 @@ def build_pdf(batch):
         if result.get("summary"):
             story.append(Paragraph("<b>Overall:</b> " + result["summary"], body))
             story.append(Spacer(1, 6))
+        if result.get("conclusion"):
+            story.append(Paragraph("<b>Head-wise conclusion:</b> " + result["conclusion"], body))
+            story.append(Spacer(1, 6))
         for i, f in enumerate(result.get("findings", []), start=1):
-            colr = sev_color.get(f.get("severity", ""), "#14233B")
+            colr = sev_color.get(f.get("severity", ""), "#002B49")
             story.append(Paragraph(
                 "<b>" + str(i) + ". " + f.get("title", "") + "</b> "
                 "<font color='" + colr + "'>[" + f.get("severity", "") + "]</font>", body))
@@ -471,21 +577,22 @@ LOGIN_PAGE = """
 <title>Baker Tilly - AI Audit Reviewer : Sign in</title>
 <style>
  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#ECEEF0;margin:0;
-      min-height:100vh;display:grid;place-items:center;color:#14233B;}
+      min-height:100vh;display:grid;place-items:center;color:#002B49;}
  .card{background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:36px 32px;
        width:100%;max-width:380px;box-shadow:0 4px 24px rgba(20,35,59,.08);text-align:center;}
- .logo{width:46px;height:46px;border-radius:50%;
-       background:radial-gradient(circle at 32% 30%,#2FD6D0,#0B7C7C);margin:0 auto 14px;}
+ .logo{height:44px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;}
+ .logo img{height:44px;}
+ .logofb{width:46px;height:46px;border-radius:50%;background:radial-gradient(circle at 32% 30%,#2FD6D0,#00A09B);}
  h1{font-size:20px;margin:0 0 4px;} .sub{font-size:13px;color:#5B7083;margin-bottom:24px;}
  label{display:block;text-align:left;font-size:12px;font-weight:600;color:#3A4A64;margin:10px 0 5px;}
  input{width:100%;box-sizing:border-box;padding:11px 13px;border:1px solid #B7BFC6;
        border-radius:6px;font-size:14px;}
- button{width:100%;padding:12px;background:#0B7C7C;color:#fff;border:none;border-radius:6px;
+ button{width:100%;padding:12px;background:#00A09B;color:#fff;border:none;border-radius:6px;
         font-size:14px;font-weight:600;cursor:pointer;margin-top:16px;}
  .err{color:#B23A2E;font-size:12.5px;min-height:16px;text-align:left;margin-top:8px;}
 </style></head><body>
 <div class="card">
- <div class="logo"></div>
+ <div class="logo"><img src="https://www.bakertilly.pk/assets/images/logo.svg" alt="Baker Tilly" onerror="this.outerHTML=&quot;<div class=logofb></div>&quot;"></div>
  <h1>AI Audit Reviewer</h1>
  <div class="sub">Baker Tilly - Authorised users only</div>
  <form method="POST">
@@ -503,46 +610,47 @@ MAIN_PAGE = """
 <title>Baker Tilly - AI Audit Reviewer</title>
 <style>
  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#ECEEF0;margin:0;
-      padding:28px;color:#14233B;}
+      padding:28px;color:#002B49;}
  .wrap{max-width:920px;margin:0 auto;}
  .top{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:6px;}
  .brand{display:flex;align-items:center;gap:12px;}
- .logo{width:40px;height:40px;border-radius:50%;
-       background:radial-gradient(circle at 32% 30%,#2FD6D0,#0B7C7C);}
+ .logo{height:36px;display:flex;align-items:center;}
+ .logo img{height:36px;}
+ .logofb{width:38px;height:38px;border-radius:50%;background:radial-gradient(circle at 32% 30%,#2FD6D0,#00A09B);}
  h1{font-size:20px;margin:0;} .sub{color:#5B7083;font-size:13px;margin-bottom:18px;}
- .who{font-size:12.5px;color:#3A4A64;} .who b{color:#14233B;}
- .who a{color:#0B7C7C;margin-left:10px;}
+ .who{font-size:12.5px;color:#3A4A64;} .who b{color:#002B49;}
+ .who a{color:#00A09B;margin-left:10px;}
  .card{background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:24px;
        box-shadow:0 2px 12px rgba(20,35,59,.06);margin-bottom:18px;}
  .notice{background:#F3ECDB;color:#5A4A28;font-size:12.5px;padding:9px 14px;border-radius:8px;margin-bottom:16px;}
  .drop{border:2px dashed #B7BFC6;border-radius:10px;padding:28px;text-align:center;transition:.15s;}
- .drop.over{border-color:#0EA5A5;background:#F1FAFA;}
+ .drop.over{border-color:#00A09B;background:#F1FAFA;}
  .drop .big{font-weight:600;margin-bottom:4px;}
  .drop .small{font-size:12.5px;color:#5B7083;margin-bottom:10px;}
  .filelist{font-size:12.5px;color:#3A4A64;margin-top:10px;text-align:left;display:inline-block;}
- button.go{background:#0B7C7C;color:#fff;border:none;padding:12px 24px;border-radius:8px;
+ button.go{background:#00A09B;color:#fff;border:none;padding:12px 24px;border-radius:8px;
         font-size:14px;font-weight:600;cursor:pointer;margin-top:12px;}
- .browse{display:inline-block;background:#EAF6F6;color:#0B7C7C;padding:9px 16px;border-radius:6px;
+ .browse{display:inline-block;background:#EAF6F6;color:#00A09B;padding:9px 16px;border-radius:6px;
         font-weight:600;font-size:13px;cursor:pointer;}
  input[type=file]{display:none;}
  .filehead{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#5B7083;margin:20px 0 8px;}
  .summary{background:#EFF5F5;border:1px solid #D9DDE1;border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:13.5px;}
  .finding{border:1px solid #D9DDE1;border-radius:8px;margin-bottom:12px;overflow:hidden;}
  .bar{height:4px;} .bar.High{background:#B23A2E;} .bar.Medium{background:#B0791C;}
- .bar.Low{background:#5B7083;} .bar.Factual{background:#14233B;}
+ .bar.Low{background:#5B7083;} .bar.Factual{background:#002B49;}
  .fbody{padding:13px 15px;}
  .ftop{display:flex;align-items:center;gap:8px;margin-bottom:7px;flex-wrap:wrap;}
  .sev{font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:10px;}
  .sev.High{background:#F5E1DE;color:#B23A2E;} .sev.Medium{background:#F3EAD3;color:#B0791C;}
- .sev.Low{background:#EAECEE;color:#5B7083;} .sev.Factual{background:#E4E7EB;color:#14233B;}
+ .sev.Low{background:#EAECEE;color:#5B7083;} .sev.Factual{background:#E4E7EB;color:#002B49;}
  .ftitle{font-weight:600;font-size:14.5px;}
  .fexpl{font-size:13px;color:#3A4A64;margin-bottom:8px;}
- .ref{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#F0F5F5;color:#0B7C7C;
-      padding:5px 9px;border-radius:4px;border-left:3px solid #0EA5A5;margin-bottom:8px;display:inline-block;}
+ .ref{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#F0F5F5;color:#00A09B;
+      padding:5px 9px;border-radius:4px;border-left:3px solid #00A09B;margin-bottom:8px;display:inline-block;}
  .fix{font-size:12.5px;color:#3A4A64;background:#F7F9F9;border:1px solid #eee;border-radius:6px;padding:8px 10px;}
- .fix b{color:#14233B;}
+ .fix b{color:#002B49;}
  .dl{display:flex;gap:10px;margin:6px 0 14px;flex-wrap:wrap;}
- .dl a{background:#14233B;color:#fff;text-decoration:none;padding:9px 16px;border-radius:6px;
+ .dl a{background:#002B49;color:#fff;text-decoration:none;padding:9px 16px;border-radius:6px;
        font-size:13px;font-weight:600;}
  .dl a.x{background:#1F6B4F;}
  .disclaimer{margin-top:18px;padding:14px;background:#FBF6EE;border:1px solid #E8D9BE;border-radius:8px;
@@ -550,16 +658,25 @@ MAIN_PAGE = """
  .err{background:#FBEAE8;border:1px solid #E4B4AD;color:#B23A2E;padding:13px;border-radius:8px;
        font-size:13px;white-space:pre-wrap;margin-bottom:12px;}
  .wait{font-size:12.5px;color:#5B7083;margin-top:8px;}
+ .overall{background:#EAF5F5;border:1px solid #BFE0DE;border-radius:10px;padding:16px 18px;margin-bottom:18px;}
+ .ov-title{font-weight:700;font-size:14px;color:#00706C;margin-bottom:6px;}
+ .ov-body{font-size:13.5px;}
+ .ov-sub{font-weight:600;font-size:12.5px;margin-top:10px;}
+ .ov-list{margin:4px 0 0 18px;font-size:12.5px;color:#3A4A64;}
+ .cnt{font-size:10px;font-weight:700;padding:2px 7px;border-radius:9px;margin-left:6px;}
+ .cnt.h{background:#F5E1DE;color:#B23A2E;} .cnt.m{background:#F3EAD3;color:#B0791C;}
+ .cnt.l{background:#EAECEE;color:#5B7083;} .cnt.f{background:#E4E7EB;color:#002B49;}
+ .conclusion{background:#FDF9F0;border:1px solid #EADFC6;border-radius:8px;padding:11px 13px;margin-bottom:14px;font-size:13px;}
 </style></head><body>
 <div class="wrap">
  <div class="top">
-  <div class="brand"><div class="logo"></div><h1>AI Audit Reviewer</h1></div>
+  <div class="brand"><div class="logo"><img src="https://www.bakertilly.pk/assets/images/logo.svg" alt="Baker Tilly" onerror="this.outerHTML=&quot;<div class=logofb></div>&quot;"></div><h1>AI Audit Reviewer</h1></div>
   <div class="who">Signed in as <b>{{ user }}</b> ({{ 'Full access' if role=='full' else 'Limited access' }})
    <a href="{{ url_for('logout') }}">Log out</a></div>
  </div>
  <div class="sub">Baker Tilly - Working-paper review - Stage 3</div>
 
- <div class="notice"><b>Note:</b> Reviews are checked against the firm's loaded standards library. Use sample / public data until the tool moves to the firm's own server. Up to {{ maxfiles }} files per batch.</div>
+ <div class="notice"><b>Note:</b> Reviews are checked against the firm's loaded standards library. Use sample / public data until the tool moves to the firm's own server. Up to {{ maxfiles }} files per batch (each file takes 1-3 minutes; for fastest results review 3-4 at a time).</div>
 
  <div class="card">
   <form method="POST" enctype="multipart/form-data" id="upform">
@@ -588,13 +705,37 @@ MAIN_PAGE = """
      <a href="{{ url_for('download_pdf', rid=batch_id) }}">Download PDF</a>
    </div>
    {% endif %}
+   {% if batch.get('overall') %}
+     <div class="overall">
+       <div class="ov-title">Overall batch conclusion</div>
+       <div class="ov-body">{{ batch['overall'].get('overall_conclusion','') }}</div>
+       {% if batch['overall'].get('common_themes') %}
+         <div class="ov-sub">Common themes across files:</div>
+         <ul class="ov-list">{% for t in batch['overall']['common_themes'] %}<li>{{ t }}</li>{% endfor %}</ul>
+       {% endif %}
+       {% if batch['overall'].get('cross_file_observations') %}
+         <div class="ov-sub">Cross-file observations (corroboration):</div>
+         <ul class="ov-list">{% for t in batch['overall']['cross_file_observations'] %}<li>{{ t }}</li>{% endfor %}</ul>
+       {% endif %}
+     </div>
+   {% endif %}
    {% for item in batch['files'] %}
-     <div class="filehead">FILE: {{ item['filename'] }}</div>
+     <div class="filehead">FILE: {{ item['filename'] }}
+       {% if item.get('counts') %}
+         <span class="cnt h">{{ item['counts']['High'] }} High</span>
+         <span class="cnt m">{{ item['counts']['Medium'] }} Med</span>
+         <span class="cnt l">{{ item['counts']['Low'] }} Low</span>
+         <span class="cnt f">{{ item['counts']['Factual'] }} Factual</span>
+       {% endif %}
+     </div>
      {% if item.get('error') %}
        <div class="err">{{ item['error'] }}</div>
      {% else %}
        {% if item['result'].get('summary') %}
          <div class="summary"><b>Overall:</b> {{ item['result']['summary'] }}</div>
+       {% endif %}
+       {% if item['result'].get('conclusion') %}
+         <div class="conclusion"><b>Head-wise conclusion:</b> {{ item['result']['conclusion'] }}</div>
        {% endif %}
        {% for f in item['result'].get('findings', []) %}
         <div class="finding">
@@ -693,6 +834,7 @@ def home():
                                               "could not be read (a scanned PDF with no "
                                               "text layer, perhaps).")
                         else:
+                            entry["excerpt"] = text[:3000]
                             result, ai_err = review_with_ai(text)
                             del text  # release the extracted text
                             if ai_err:
@@ -703,6 +845,21 @@ def home():
                         entry["error"] = "Could not process this file. Details: " + str(e)
                     batch["files"].append(entry)
                     gc.collect()  # reclaim memory before the next file
+
+                # severity counts per file (computed here, not by the AI)
+                for item in batch["files"]:
+                    counts = {"High": 0, "Medium": 0, "Low": 0, "Factual": 0}
+                    for f in item.get("result", {}).get("findings", []):
+                        sev = f.get("severity", "")
+                        if sev in counts:
+                            counts[sev] += 1
+                    item["counts"] = counts
+
+                # batch-level conclusion + cross-file corroboration (2+ files)
+                if len(batch["files"]) > 1:
+                    batch["overall"] = batch_conclusion_with_ai(batch)
+                for item in batch["files"]:
+                    item.pop("excerpt", None)
                 batch_id = save_results(batch)
 
     return render_template_string(MAIN_PAGE, user=session.get("user"),
