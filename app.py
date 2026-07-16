@@ -153,11 +153,18 @@ def _extract_xlsx_lightweight(file_bytes):
         # shared strings (xlsx stores text centrally)
         shared = []
         if "xl/sharedStrings.xml" in names:
+            SHARED_CAP = 2_000_000  # cap total shared-text characters (memory guard)
+            shared_total = 0
             with z.open("xl/sharedStrings.xml") as f:
                 for ev, el in iterparse(f, events=("end",)):
                     if el.tag == NS + "si":
-                        texts = [t.text or "" for t in el.iter(NS + "t")]
-                        shared.append("".join(texts))
+                        if shared_total < SHARED_CAP:
+                            texts = [t.text or "" for t in el.iter(NS + "t")]
+                            s = "".join(texts)
+                            shared.append(s)
+                            shared_total += len(s)
+                        else:
+                            shared.append("")  # beyond cap: placeholder
                         el.clear()  # clear only completed string items
 
         # sheet name map (falls back to file order if unavailable)
