@@ -78,7 +78,11 @@ def server_error(e):
         return msg, 500
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+# timeout: never wait more than 150s for one API attempt (retry once), so a
+# slow/hung DeepSeek response fails with a friendly per-file message instead
+# of blocking until gunicorn kills the whole worker mid-request.
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com",
+                timeout=150.0, max_retries=1)
 
 MAX_FILES_PER_BATCH = 8
 MAX_EXTRACT_CHARS = 45000
@@ -382,12 +386,21 @@ def review_with_ai(document_text, mode="wp", user_instructions=""):
             "issues you notice):\n\n" + user_instructions.strip()[:2000]})
     messages.append({"role": "user", "content":
         "Here is the " + doc_label + " to review:\n\n" + trimmed})
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=messages,
-        max_tokens=6000,
-        temperature=0.2,
-    )
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            max_tokens=6000,
+            temperature=0.2,
+        )
+    except Exception as e:
+        err_name = type(e).__name__
+        if "Timeout" in err_name or "timeout" in str(e).lower():
+            return None, ("The AI service took too long to respond for this file "
+                          "(over 5 minutes including a retry). This is usually "
+                          "temporary — please try this file again in a few minutes.")
+        return None, ("The AI service could not be reached for this file. "
+                      "Please try again shortly. Details: " + err_name)
     raw = response.choices[0].message.content.strip()
     return parse_ai_json(raw)
 
