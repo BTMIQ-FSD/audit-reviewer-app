@@ -1,8 +1,12 @@
 """
-Baker Tilly AI Audit Reviewer — Stage 3
-Adds: login with authorised user accounts and access levels,
-multi-file drag-and-drop upload (up to 3 files per batch),
-downloadable findings (Excel and PDF), and larger AI responses (cut-off fix).
+Baker Tilly AI Audit Reviewer — Stage 4
+Adds: post-login chooser page (Financial Statements review vs Working-paper
+review, each with its own tailored AI review logic), an optional instruction
+box at upload (tell the AI what to focus on), and a dark navy header band so
+the white firm logo is visible. Retains from earlier stages: login with roles,
+multi-file drag-and-drop, knowledge-library citations, Excel/PDF downloads,
+gunicorn 600s timeout, tolerant JSON parser, lightweight Excel reader with
+shared-text cap, per-file memory release, friendly 413/500 pages.
 
 USER ACCOUNTS (managed by the administrator, never stored in this public code):
 Set an environment variable on Render called USERS in this format:
@@ -53,6 +57,7 @@ def too_large(e):
                                   role=session.get("role", "limited"), error=msg,
                                   batch=None, batch_id=None,
                                   maxfiles=MAX_FILES_PER_BATCH,
+                                  mode=session.get("mode", "wp"),
                                   disclaimer=DISCLAIMER), 413
 
 
@@ -67,6 +72,7 @@ def server_error(e):
                                       role=session.get("role", "limited"), error=msg,
                                       batch=None, batch_id=None,
                                       maxfiles=MAX_FILES_PER_BATCH,
+                                      mode=session.get("mode", "wp"),
                                       disclaimer=DISCLAIMER), 500
     except Exception:
         return msg, 500
@@ -314,15 +320,71 @@ Return your answer as a JSON object with this exact structure:
 Return ONLY the JSON, no other text."""
 
 
-def review_with_ai(document_text):
+FS_REVIEWER_INSTRUCTIONS = """You are an experienced audit reviewer at an accounting firm, reviewing a set of FINANCIAL STATEMENTS (or extracts from them) to the standard expected in an ICAP Quality Control Review or an Audit Oversight Board inspection.
+
+You will be given text extracted from draft or final financial statements (statement of financial position, profit or loss, changes in equity, cash flows, and/or the notes).
+
+Review carefully and identify EVERY discrepancy, error, omission, weakness, or matter needing attention. Look specifically for:
+- Figures that do not agree between the face of the statements and the supporting notes (tie-out failures)
+- Totals or subtotals that do not add up; casting errors
+- Broken spreadsheet values such as #REF!, #DIV/0!, #VALUE! - these are hard errors
+- Missing or incomplete disclosures required by the applicable standards (e.g. related party disclosures per IAS 24, revenue disaggregation per IFRS 15)
+- IAS 1 presentation problems: material classes not presented separately, missing comparative figures, missing cross-references between the face and the notes
+- Accounting policies that are missing, boilerplate, or inconsistent with the figures presented
+- Inconsistencies between different statements (e.g. profit per P&L not agreeing with the movement in retained earnings)
+- Companies Act 2017 concerns: anything preventing a true and fair view
+- Content that appears to belong to a DIFFERENT company (wrong name, copy-paste contamination from a template)
+
+For EACH issue you find, give:
+1. A short, clear title of the issue
+2. A plain-English explanation (simple language a junior staff member can understand - avoid unnecessary jargon)
+3. The applicable standard or rule reference
+4. A severity: High, Medium, or Low (or "Factual" for arithmetic/broken-value errors that are simply right or wrong)
+5. A suggested fix - what the team should do to resolve it
+
+IMPORTANT RULES:
+- You are given the FIRM'S STANDARDS LIBRARY below. Base every standard reference on that library. When your finding is supported by the library, cite it (e.g. "IAS 1 para 29 (per firm standards library)").
+- If an issue is real but the library does not cover it, still raise it, but mark the reference as "outside loaded library - reference to be confirmed".
+- Never invent a standard, paragraph number, or fact. If unsure, say so.
+- Write everything in easy-to-understand English.
+- Base your findings on what is actually in the document provided, not assumptions.
+
+Return your answer as a JSON object with this exact structure:
+{
+  "findings": [
+    {
+      "title": "...",
+      "explanation": "...",
+      "reference": "...",
+      "severity": "High | Medium | Low | Factual",
+      "fix": "..."
+    }
+  ],
+  "summary": "A one or two sentence overall summary of the statements' condition.",
+  "conclusion": "A 2-4 sentence conclusion in plain English: the overall condition of these financial statements, whether they currently appear ready for sign-off, and what must be fixed first."
+}
+Return ONLY the JSON, no other text."""
+
+
+def review_with_ai(document_text, mode="wp", user_instructions=""):
     trimmed = document_text[:MAX_EXTRACT_CHARS]
+    instructions = FS_REVIEWER_INSTRUCTIONS if mode == "fs" else REVIEWER_INSTRUCTIONS
+    doc_label = ("financial statements" if mode == "fs" else "working paper")
+    messages = [
+        {"role": "system", "content": instructions},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY (check against these texts):\n\n" + KNOWLEDGE_BASE},
+    ]
+    if user_instructions.strip():
+        messages.append({"role": "system", "content":
+            "SPECIFIC INSTRUCTIONS FROM THE REVIEWER FOR THIS BATCH (follow these, "
+            "give the requested areas extra attention, and answer any questions asked "
+            "within your findings or summary — but still report any other significant "
+            "issues you notice):\n\n" + user_instructions.strip()[:2000]})
+    messages.append({"role": "user", "content":
+        "Here is the " + doc_label + " to review:\n\n" + trimmed})
     response = client.chat.completions.create(
         model="deepseek-chat",
-        messages=[
-            {"role": "system", "content": REVIEWER_INSTRUCTIONS},
-            {"role": "system", "content": "FIRM'S STANDARDS LIBRARY (check against these texts):\n\n" + KNOWLEDGE_BASE},
-            {"role": "user", "content": "Here is the working paper to review:\n\n" + trimmed},
-        ],
+        messages=messages,
         max_tokens=6000,
         temperature=0.2,
     )
@@ -578,6 +640,72 @@ def build_pdf(batch):
     return buf
 
 
+CHOOSE_PAGE = """
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Baker Tilly - AI Audit Reviewer : Choose review type</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0c1b34;margin:0;
+      min-height:100vh;display:grid;place-items:center;color:#fff;overflow-x:hidden;}
+ .stage{position:relative;width:100%;max-width:720px;padding:40px 20px;text-align:center;}
+ .dot{position:absolute;border-radius:50%;pointer-events:none;}
+ .d1{top:10%;left:6%;width:6px;height:6px;background:#2dd4bf;opacity:.35;animation:drift1 9s ease-in-out infinite;}
+ .d2{top:72%;left:14%;width:9px;height:9px;background:#5eead4;opacity:.25;animation:drift2 11s ease-in-out infinite;}
+ .d3{top:26%;left:86%;width:7px;height:7px;background:#2dd4bf;opacity:.3;animation:drift1 13s ease-in-out infinite;}
+ .d4{top:84%;left:78%;width:5px;height:5px;background:#7c6cf0;opacity:.35;animation:drift2 8s ease-in-out infinite;}
+ .d5{top:52%;left:47%;width:4px;height:4px;background:#5eead4;opacity:.2;animation:drift1 10s ease-in-out infinite;}
+ .brand{display:inline-flex;align-items:center;gap:12px;margin-bottom:4px;
+        animation:float 4.5s ease-in-out infinite;}
+ .brand img{height:46px;}
+ .logofb{width:46px;height:46px;border-radius:50%;background:radial-gradient(circle at 32% 30%,#2FD6D0,#00A09B);}
+ h1{font-size:23px;margin:10px 0 2px;font-weight:600;animation:fadeUp .8s ease both;}
+ .sub{color:#9fb3cc;font-size:14px;margin-bottom:30px;animation:fadeUp .8s .05s ease both;}
+ .who{position:absolute;top:14px;right:18px;font-size:12px;color:#9fb3cc;}
+ .who b{color:#fff;} .who a{color:#5eead4;margin-left:8px;text-decoration:none;}
+ .choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;
+          max-width:540px;margin:0 auto;}
+ .choice{display:block;text-decoration:none;background:rgba(255,255,255,.05);
+         border:1px solid rgba(94,234,212,.18);border-radius:12px;padding:26px 20px;
+         transition:transform .25s ease,border-color .25s ease,background .25s ease;}
+ .choice:hover{transform:translateY(-6px);border-color:#2dd4bf;background:rgba(45,212,191,.12);}
+ .c1{animation:fadeUp .8s .15s ease both;} .c2{animation:fadeUp .8s .3s ease both;}
+ .cico{font-size:30px;margin-bottom:10px;}
+ .ctitle{color:#fff;font-size:16px;font-weight:600;margin-bottom:6px;}
+ .cdesc{color:#9fb3cc;font-size:12.5px;line-height:1.6;}
+ .foot{color:#6c8099;font-size:11px;max-width:440px;margin:30px auto 0;line-height:1.55;
+       animation:fadeUp .8s .45s ease both;}
+ @keyframes fadeUp{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0);}}
+ @keyframes float{0%,100%{transform:translateY(0);}50%{transform:translateY(-8px);}}
+ @keyframes drift1{0%,100%{transform:translate(0,0);}50%{transform:translate(10px,-16px);}}
+ @keyframes drift2{0%,100%{transform:translate(0,0);}50%{transform:translate(-12px,14px);}}
+</style></head><body>
+<div class="stage">
+ <span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span>
+ <span class="dot d4"></span><span class="dot d5"></span>
+ <div class="who">Signed in as <b>{{ user }}</b>
+  <a href="{{ url_for('logout') }}">Log out</a></div>
+ <div class="brand">
+  <img src="https://www.bakertilly.pk/assets/images/logo.svg" alt="Baker Tilly"
+       onerror="this.outerHTML=&quot;<div class=logofb></div>&quot;">
+ </div>
+ <h1>AI Audit Reviewer</h1>
+ <div class="sub">Choose a review type to begin</div>
+ <div class="choices">
+  <a class="choice c1" href="{{ url_for('select_mode', mode='fs') }}">
+   <div class="cico">&#128202;</div>
+   <div class="ctitle">Financial Statements review</div>
+   <div class="cdesc">Disclosures, IAS 1 presentation, note tie-outs, true and fair view</div>
+  </a>
+  <a class="choice c2" href="{{ url_for('select_mode', mode='wp') }}">
+   <div class="cico">&#128203;</div>
+   <div class="ctitle">Working-paper review</div>
+   <div class="cdesc">Evidence, sign-offs, ISA 230 documentation, ISA 500 sufficiency</div>
+  </a>
+ </div>
+ <div class="foot">Every AI output is a draft — final professional judgement rests with the audit team.</div>
+</div></body></html>
+"""
+
 LOGIN_PAGE = """
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -617,16 +745,23 @@ MAIN_PAGE = """
 <title>Baker Tilly - AI Audit Reviewer</title>
 <style>
  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#ECEEF0;margin:0;
-      padding:28px;color:#002B49;}
- .wrap{max-width:920px;margin:0 auto;}
- .top{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:6px;}
+      padding:0 0 28px;color:#002B49;}
+ .band{background:#0c1b34;padding:16px 28px;margin-bottom:20px;}
+ .wrap{max-width:920px;margin:0 auto;padding:0 28px;}
+ .top{max-width:920px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;}
  .brand{display:flex;align-items:center;gap:12px;}
  .logo{height:36px;display:flex;align-items:center;}
  .logo img{height:36px;}
  .logofb{width:38px;height:38px;border-radius:50%;background:radial-gradient(circle at 32% 30%,#2FD6D0,#00A09B);}
- h1{font-size:20px;margin:0;} .sub{color:#5B7083;font-size:13px;margin-bottom:18px;}
- .who{font-size:12.5px;color:#3A4A64;} .who b{color:#002B49;}
- .who a{color:#00A09B;margin-left:10px;}
+ h1{font-size:20px;margin:0;color:#fff;} .sub{color:#5B7083;font-size:13px;margin-bottom:18px;}
+ .sub a{color:#00A09B;text-decoration:none;font-weight:600;}
+ .who{font-size:12.5px;color:#9fb3cc;} .who b{color:#fff;}
+ .who a{color:#5eead4;margin-left:10px;}
+ .instr{width:100%;box-sizing:border-box;margin-top:14px;padding:11px 13px;
+        border:1px solid #B7BFC6;border-radius:8px;font-size:13px;font-family:inherit;
+        min-height:64px;resize:vertical;color:#002B49;}
+ .instr-label{font-size:12.5px;font-weight:600;color:#3A4A64;margin:16px 0 5px;text-align:left;}
+ .instr-hint{font-size:11.5px;color:#5B7083;margin-top:4px;text-align:left;}
  .card{background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:24px;
        box-shadow:0 2px 12px rgba(20,35,59,.06);margin-bottom:18px;}
  .notice{background:#F3ECDB;color:#5A4A28;font-size:12.5px;padding:9px 14px;border-radius:8px;margin-bottom:16px;}
@@ -675,25 +810,32 @@ MAIN_PAGE = """
  .cnt.l{background:#EAECEE;color:#5B7083;} .cnt.f{background:#E4E7EB;color:#002B49;}
  .conclusion{background:#FDF9F0;border:1px solid #EADFC6;border-radius:8px;padding:11px 13px;margin-bottom:14px;font-size:13px;}
 </style></head><body>
-<div class="wrap">
+<div class="band">
  <div class="top">
   <div class="brand"><div class="logo"><img src="https://www.bakertilly.pk/assets/images/logo.svg" alt="Baker Tilly" onerror="this.outerHTML=&quot;<div class=logofb></div>&quot;"></div><h1>AI Audit Reviewer</h1></div>
   <div class="who">Signed in as <b>{{ user }}</b> ({{ 'Full access' if role=='full' else 'Limited access' }})
    <a href="{{ url_for('logout') }}">Log out</a></div>
  </div>
- <div class="sub">Baker Tilly - Working-paper review - Stage 3</div>
+</div>
+<div class="wrap">
+ <div class="sub">Baker Tilly - {{ 'Financial Statements review' if mode=='fs' else 'Working-paper review' }} - Stage 4
+   &nbsp;|&nbsp; <a href="{{ url_for('choose') }}">Change review type</a></div>
 
  <div class="notice"><b>Note:</b> Reviews are checked against the firm's loaded standards library. Use sample / public data until the tool moves to the firm's own server. Up to {{ maxfiles }} files per batch (each file takes 1-3 minutes; for fastest results review 3-4 at a time).</div>
 
  <div class="card">
   <form method="POST" enctype="multipart/form-data" id="upform">
    <div class="drop" id="drop">
-    <div class="big">Drag &amp; drop working papers here</div>
+    <div class="big">Drag &amp; drop {{ 'financial statements' if mode=='fs' else 'working papers' }} here</div>
     <div class="small">Excel (.xlsx), Word (.docx), PDF, or CSV - up to {{ maxfiles }} files</div>
     <label class="browse">Browse files<input type="file" id="fileinput" name="files" multiple
       accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt"></label>
     <div class="filelist" id="filelist"></div>
    </div>
+   <div class="instr-label">Instructions for the AI (optional)</div>
+   <textarea class="instr" name="instructions" maxlength="2000"
+     placeholder="e.g. Focus on cut-off testing near year end, or: Explain the related-party issue in the revenue file"></textarea>
+   <div class="instr-hint">Tell the reviewer what to focus on or ask a question about the files. Leave blank for a full standard review.</div>
    <div style="text-align:center;">
      <button class="go" type="submit">Review selected files</button>
      <div class="wait">Reviews take 1-3 minutes per file. Please leave the page open and wait.</div>
@@ -799,7 +941,7 @@ def login():
         if u and u["password"] == pw:
             session["user"] = name
             session["role"] = u["role"]
-            return redirect(url_for("home"))
+            return redirect(url_for("choose"))
         error = "Incorrect username or password."
     return render_template_string(LOGIN_PAGE, error=error)
 
@@ -810,9 +952,26 @@ def logout():
     return redirect(url_for("login"))
 
 
+@app.route("/choose")
+@login_required
+def choose():
+    return render_template_string(CHOOSE_PAGE, user=session.get("user"))
+
+
+@app.route("/select/<mode>")
+@login_required
+def select_mode(mode):
+    if mode not in ("fs", "wp"):
+        return redirect(url_for("choose"))
+    session["mode"] = mode
+    return redirect(url_for("home"))
+
+
 @app.route("/", methods=["GET", "POST"])
 @login_required
 def home():
+    if session.get("mode") not in ("fs", "wp"):
+        return redirect(url_for("choose"))
     error = None
     batch = None
     batch_id = None
@@ -842,7 +1001,9 @@ def home():
                                               "text layer, perhaps).")
                         else:
                             entry["excerpt"] = text[:3000]
-                            result, ai_err = review_with_ai(text)
+                            result, ai_err = review_with_ai(
+                                text, mode=session.get("mode", "wp"),
+                                user_instructions=request.form.get("instructions", ""))
                             del text  # release the extracted text
                             if ai_err:
                                 entry["error"] = ai_err
@@ -873,6 +1034,7 @@ def home():
                                   role=session.get("role"), error=error,
                                   batch=batch, batch_id=batch_id,
                                   maxfiles=MAX_FILES_PER_BATCH,
+                                  mode=session.get("mode", "wp"),
                                   disclaimer=DISCLAIMER)
 
 
