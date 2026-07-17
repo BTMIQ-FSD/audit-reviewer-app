@@ -804,6 +804,21 @@ MAIN_PAGE = """
       padding:5px 9px;border-radius:4px;border-left:3px solid #00A09B;margin-bottom:8px;display:inline-block;}
  .fix{font-size:12.5px;color:#3A4A64;background:#F7F9F9;border:1px solid #eee;border-radius:6px;padding:8px 10px;}
  .fix b{color:#002B49;}
+ .disc-btn{margin-top:10px;background:#EAF6F6;color:#00706C;border:1px solid #BFE0DE;
+        padding:7px 14px;border-radius:6px;font-size:12.5px;font-weight:600;cursor:pointer;}
+ .disc-btn:hover{background:#DDF1F0;}
+ .disc{margin-top:10px;border:1px solid #BFE0DE;border-radius:8px;background:#F7FBFB;padding:10px;}
+ .dlog{max-height:340px;overflow-y:auto;margin-bottom:8px;}
+ .dmsg{padding:8px 11px;border-radius:8px;margin-bottom:7px;font-size:12.5px;line-height:1.55;white-space:pre-wrap;}
+ .du{background:#E4EFF9;color:#0A3556;margin-left:12%;}
+ .da{background:#fff;border:1px solid #D9DDE1;color:#3A4A64;margin-right:12%;}
+ .dwait{color:#5B7083;font-size:12px;font-style:italic;margin-bottom:7px;}
+ .drow{display:flex;gap:8px;align-items:flex-end;}
+ .din{flex:1;box-sizing:border-box;padding:8px 10px;border:1px solid #B7BFC6;border-radius:6px;
+      font-size:12.5px;font-family:inherit;resize:vertical;min-height:38px;}
+ .dsend{background:#00A09B;color:#fff;border:none;padding:9px 16px;border-radius:6px;
+        font-size:12.5px;font-weight:600;cursor:pointer;}
+ .dnote{font-size:10.5px;color:#8595A5;margin-top:5px;}
  .dl{display:flex;gap:10px;margin:6px 0 14px;flex-wrap:wrap;}
  .dl a{background:#002B49;color:#fff;text-decoration:none;padding:9px 16px;border-radius:6px;
        font-size:13px;font-weight:600;}
@@ -882,6 +897,7 @@ MAIN_PAGE = """
      </div>
    {% endif %}
    {% for item in batch['files'] %}
+     {% set fidx = loop.index0 %}
      <div class="filehead">FILE: {{ item['filename'] }}
        {% if item.get('counts') %}
          <span class="cnt h">{{ item['counts']['High'] }} High</span>
@@ -908,6 +924,15 @@ MAIN_PAGE = """
           <div class="fexpl">{{ f.get('explanation','') }}</div>
           {% if f.get('reference') %}<div class="ref">{{ f['reference'] }}</div>{% endif %}
           <div class="fix"><b>Suggested fix:</b> {{ f.get('fix','') }}</div>
+          <button class="disc-btn" type="button" onclick="discToggle(this)">&#128172; Discuss with AI</button>
+          <div class="disc" hidden data-f="{{ fidx }}" data-g="{{ loop.index0 }}">
+            <div class="dlog"></div>
+            <div class="drow">
+              <textarea class="din" rows="2" placeholder="Ask a question, object, or challenge this point..."></textarea>
+              <button type="button" class="dsend" onclick="discSend(this)">Send</button>
+            </div>
+            <div class="dnote">AI discussion is a draft aid — final judgement rests with the audit team. Discussions are not saved and end when the report expires.</div>
+          </div>
          </div>
         </div>
        {% endfor %}
@@ -938,6 +963,63 @@ input.addEventListener('change', () => showFiles(input.files));
 drop.addEventListener('drop', e => {
   if(e.dataTransfer.files.length){ input.files = e.dataTransfer.files; showFiles(input.files); }
 });
+
+const RID = {{ (batch_id or "") | tojson }};
+
+function discToggle(btn){
+  const d = btn.nextElementSibling;
+  d.hidden = !d.hidden;
+  if(!d.hidden){ d.querySelector('.din').focus(); }
+}
+
+function addMsg(log, cls, text){
+  const m = document.createElement('div');
+  m.className = 'dmsg ' + cls;
+  m.textContent = text;
+  log.appendChild(m);
+  log.scrollTop = log.scrollHeight;
+  return m;
+}
+
+function discSend(btn){
+  const box = btn.closest('.disc');
+  const log = box.querySelector('.dlog');
+  const inp = box.querySelector('.din');
+  const q = inp.value.trim();
+  if(!q) return;
+  if(!box._hist) box._hist = [];
+  inp.value = '';
+  btn.disabled = true;
+  addMsg(log, 'du', q);
+  const wait = document.createElement('div');
+  wait.className = 'dwait';
+  wait.textContent = 'The reviewer is thinking...';
+  log.appendChild(wait); log.scrollTop = log.scrollHeight;
+  fetch('/discuss', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      rid: RID,
+      file_index: parseInt(box.dataset.f),
+      finding_index: parseInt(box.dataset.g),
+      question: q,
+      history: box._hist
+    })
+  }).then(r => r.json()).then(data => {
+    wait.remove();
+    if(data.answer){
+      addMsg(log, 'da', data.answer);
+      box._hist.push({role:'user', content:q});
+      box._hist.push({role:'assistant', content:data.answer});
+      if(box._hist.length > 16){ box._hist = box._hist.slice(-16); }
+    } else {
+      addMsg(log, 'da', data.error || 'Something went wrong. Please try again.');
+    }
+  }).catch(() => {
+    wait.remove();
+    addMsg(log, 'da', 'Could not reach the server. Please check your connection and try again.');
+  }).finally(() => { btn.disabled = false; });
+}
 </script>
 </body></html>
 """
@@ -1039,8 +1121,11 @@ def home():
                 # batch-level conclusion + cross-file corroboration (2+ files)
                 if len(batch["files"]) > 1:
                     batch["overall"] = batch_conclusion_with_ai(batch)
+                # keep a trimmed excerpt in the saved results so the per-finding
+                # "Discuss with AI" feature has the file content as context
                 for item in batch["files"]:
-                    item.pop("excerpt", None)
+                    if item.get("excerpt"):
+                        item["excerpt"] = item["excerpt"][:3000]
                 batch_id = save_results(batch)
 
     return render_template_string(MAIN_PAGE, user=session.get("user"),
@@ -1049,6 +1134,84 @@ def home():
                                   maxfiles=MAX_FILES_PER_BATCH,
                                   mode=session.get("mode", "wp"),
                                   disclaimer=DISCLAIMER)
+
+
+DISCUSS_INSTRUCTIONS = """You are an experienced audit reviewer at an accounting firm, in a follow-up discussion about ONE specific review finding that was raised on a file.
+
+The user may: question whether the finding is correct, object to it, ask you to explain it more deeply or more simply, ask what evidence or fix is needed, or ask how the standards apply.
+
+RULES:
+- Be honest and objective. If the user's objection is valid or the original finding looks wrong or doubtful given the file content, SAY SO plainly and explain why — never defend a finding just because it was raised. It is normal for some findings to be revised or withdrawn on discussion.
+- If the finding still stands, explain clearly why, using the file content and the firm's standards library.
+- Cite standards only from the provided firm standards library; if the point falls outside it, say "outside loaded library — reference to be confirmed".
+- Never invent facts, figures, or paragraph numbers. If the provided file excerpt does not show enough to be sure, say what additional evidence would settle it.
+- Plain, easy English. Be concise: a few short paragraphs at most.
+- You are a draft reviewer only — final professional judgement rests with the audit team. Do not claim authority to conclude.
+Respond with plain text only (no JSON, no markdown headings)."""
+
+
+@app.route("/discuss", methods=["POST"])
+@login_required
+def discuss():
+    if not DEEPSEEK_API_KEY:
+        return {"error": "The DeepSeek API key is not set."}, 500
+    data = request.get_json(silent=True) or {}
+    rid = str(data.get("rid", ""))
+    question = str(data.get("question", "")).strip()[:2000]
+    history = data.get("history", [])
+    if not question:
+        return {"error": "Please type a question."}, 400
+    batch = load_results(rid)
+    if not batch:
+        return {"error": "This report has expired (reports are kept temporarily). "
+                         "Please run the review again, then discuss."}, 404
+    try:
+        fidx = int(data.get("file_index", -1))
+        gidx = int(data.get("finding_index", -1))
+        item = batch["files"][fidx]
+        finding = item["result"]["findings"][gidx]
+    except Exception:
+        return {"error": "That finding could not be found in the saved report."}, 404
+
+    context = ("FILE NAME: " + item.get("filename", "") + "\n\n"
+               "THE FINDING UNDER DISCUSSION:\n"
+               "Title: " + str(finding.get("title", "")) + "\n"
+               "Severity: " + str(finding.get("severity", "")) + "\n"
+               "Explanation: " + str(finding.get("explanation", "")) + "\n"
+               "Reference: " + str(finding.get("reference", "")) + "\n"
+               "Suggested fix: " + str(finding.get("fix", "")) + "\n\n"
+               "EXCERPT OF THE FILE CONTENT (may be partial):\n"
+               + (item.get("excerpt") or "(no excerpt retained)"))
+
+    messages = [
+        {"role": "system", "content": DISCUSS_INSTRUCTIONS},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY:\n\n" + KNOWLEDGE_BASE},
+        {"role": "system", "content": context},
+    ]
+    # replay up to the last 8 turns of this discussion so the AI has the thread
+    if isinstance(history, list):
+        for h in history[-8:]:
+            r = h.get("role")
+            c = str(h.get("content", ""))[:2000]
+            if r in ("user", "assistant") and c:
+                messages.append({"role": r, "content": c})
+    messages.append({"role": "user", "content": question})
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            max_tokens=1200,
+            temperature=0.2,
+        )
+        answer = response.choices[0].message.content.strip()
+    except Exception as e:
+        err_name = type(e).__name__
+        if "Timeout" in err_name or "timeout" in str(e).lower():
+            return {"error": "The AI took too long to answer. Please try again."}, 504
+        return {"error": "The AI could not be reached. Please try again. "
+                         "(" + err_name + ")"}, 502
+    return {"answer": answer}
 
 
 @app.route("/download/excel/<rid>")
