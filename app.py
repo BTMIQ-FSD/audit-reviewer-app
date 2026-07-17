@@ -23,6 +23,7 @@ Also set SECRET_KEY to any long random text (keeps logins secure).
 import os
 import io
 import json
+import time
 import uuid
 import tempfile
 from functools import wraps
@@ -58,6 +59,7 @@ def too_large(e):
                                   batch=None, batch_id=None,
                                   maxfiles=MAX_FILES_PER_BATCH,
                                   mode=session.get("mode", "wp"),
+                                  history=[],
                                   disclaimer=DISCLAIMER), 413
 
 
@@ -73,19 +75,35 @@ def server_error(e):
                                       batch=None, batch_id=None,
                                       maxfiles=MAX_FILES_PER_BATCH,
                                       mode=session.get("mode", "wp"),
+                                      history=[],
                                       disclaimer=DISCLAIMER), 500
     except Exception:
         return msg, 500
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Engine switch: set AI_PROVIDER=claude (plus ANTHROPIC_API_KEY) in Render to
+# run reviews on Claude; anything else uses DeepSeek. AI_MODEL can override
+# the default model name for either provider. No code change needed to switch.
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "deepseek").strip().lower()
 # timeout: never wait more than 150s for one API attempt (retry once), so a
-# slow/hung DeepSeek response fails with a friendly per-file message instead
-# of blocking until gunicorn kills the whole worker mid-request.
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com",
-                timeout=150.0, max_retries=1)
+# slow/hung response fails with a friendly per-file message instead of
+# blocking until gunicorn kills the whole worker mid-request.
+if AI_PROVIDER == "claude" and ANTHROPIC_API_KEY:
+    client = OpenAI(api_key=ANTHROPIC_API_KEY,
+                    base_url="https://api.anthropic.com/v1/",
+                    timeout=150.0, max_retries=1)
+    AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-5")
+    AI_KEY_SET = True
+else:
+    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com",
+                    timeout=150.0, max_retries=1)
+    AI_MODEL = os.environ.get("AI_MODEL", "deepseek-chat")
+    AI_KEY_SET = bool(DEEPSEEK_API_KEY)
 
 MAX_FILES_PER_BATCH = 8
-MAX_EXTRACT_CHARS = 45000
+MAX_EXTRACT_CHARS = 120000
+ANCHOR_CHARS = 20000  # how much of the anchor (e.g. signed FS) each review sees
 RESULTS_DIR = os.path.join(tempfile.gettempdir(), "audit_results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -307,6 +325,15 @@ IMPORTANT RULES:
 - Write everything in easy-to-understand English.
 - Base your findings on what is actually in the document provided, not assumptions.
 
+QUALITY RULES (these determine whether the review is professional or noise):
+- Report each underlying issue exactly ONCE. If the same problem appears in several sheets or places, write ONE finding and list the affected locations inside it. Never raise the same conclusion, comment, or error twice under different titles.
+- NEVER include an item that turns out to be fine. If you check something and it is correct, silently omit it — a finding must always identify a real problem needing action.
+- Cite a standard only when it genuinely governs that specific issue. If no loaded standard directly applies, use "outside loaded library - reference to be confirmed" rather than stretching an unrelated standard to fit.
+- Order findings from most important to least important (highest risk to the audit first).
+- A maximum of 20 findings. If more issues exist, keep the 19 most important and combine the remaining minor points into one final finding titled "Other minor matters" that lists them briefly.
+- Keep each explanation specific and tight: name the sheet/cell/figure and state the problem in at most ~60 words. Do not think out loud, do not narrate calculations that turned out correct.
+- Severity discipline: High = could indicate material misstatement or makes the work unreliable; Medium = documentation/consistency weakness; Low = minor improvement; Factual = broken values or arithmetic that is simply wrong.
+
 Return your answer as a JSON object with this exact structure:
 {
   "findings": [
@@ -353,6 +380,15 @@ IMPORTANT RULES:
 - Write everything in easy-to-understand English.
 - Base your findings on what is actually in the document provided, not assumptions.
 
+QUALITY RULES (these determine whether the review is professional or noise):
+- Report each underlying issue exactly ONCE. If the same problem appears in several statements or notes, write ONE finding and list the affected locations inside it. Never raise the same issue twice under different titles.
+- NEVER include an item that turns out to be fine. If you check something and it is correct, silently omit it — a finding must always identify a real problem needing action.
+- Cite a standard only when it genuinely governs that specific issue. If no loaded standard directly applies, use "outside loaded library - reference to be confirmed" rather than stretching an unrelated standard to fit.
+- Order findings from most important to least important (highest risk first).
+- A maximum of 20 findings. If more issues exist, keep the 19 most important and combine the remaining minor points into one final finding titled "Other minor matters" that lists them briefly.
+- Keep each explanation specific and tight: name the statement/note/figure and state the problem in at most ~60 words. Do not think out loud, do not narrate checks that turned out correct.
+- Severity discipline: High = could indicate material misstatement or prevents a true and fair view; Medium = disclosure/presentation weakness; Low = minor improvement; Factual = broken values or arithmetic that is simply wrong.
+
 Return your answer as a JSON object with this exact structure:
 {
   "findings": [
@@ -370,7 +406,8 @@ Return your answer as a JSON object with this exact structure:
 Return ONLY the JSON, no other text."""
 
 
-def review_with_ai(document_text, mode="wp", user_instructions=""):
+def review_with_ai(document_text, mode="wp", user_instructions="",
+                   anchor_name="", anchor_text=""):
     trimmed = document_text[:MAX_EXTRACT_CHARS]
     instructions = FS_REVIEWER_INSTRUCTIONS if mode == "fs" else REVIEWER_INSTRUCTIONS
     doc_label = ("financial statements" if mode == "fs" else "working paper")
@@ -378,6 +415,25 @@ def review_with_ai(document_text, mode="wp", user_instructions=""):
         {"role": "system", "content": instructions},
         {"role": "system", "content": "FIRM'S STANDARDS LIBRARY (check against these texts):\n\n" + KNOWLEDGE_BASE},
     ]
+    if anchor_text:
+        messages.append({"role": "system", "content":
+            "REFERENCE / ANCHOR DOCUMENT (\"" + anchor_name + "\") — extract:\n\n"
+            + anchor_text +
+            "\n\nCROSS-CHECK REQUIREMENT: review the document below AGAINST this "
+            "reference document, in addition to the normal review. Specifically:\n"
+            "(1) TIE-OUTS: amounts and totals that should agree between the two "
+            "(e.g. lead schedules vs the face of the statements and notes) — report "
+            "any that do not agree, quoting BOTH figures;\n"
+            "(2) CONTRADICTIONS: matters disclosed or stated in one document but "
+            "denied, ignored, or treated inconsistently in the other;\n"
+            "(3) IMPOSSIBLE DATES: dates in the document under review that are "
+            "impossible or illogical relative to the reference (e.g. audit evidence "
+            "dated after the audit report date, transactions after year end included "
+            "in the year);\n"
+            "(4) OMISSIONS: items appearing in one document that are unexplainably "
+            "missing from the other.\n"
+            "Tie-out failures and direct contradictions are High severity. In such "
+            "findings, name both documents so the team can locate the difference."})
     if user_instructions.strip():
         messages.append({"role": "system", "content":
             "SPECIFIC INSTRUCTIONS FROM THE REVIEWER FOR THIS BATCH (follow these, "
@@ -388,7 +444,7 @@ def review_with_ai(document_text, mode="wp", user_instructions=""):
         "Here is the " + doc_label + " to review:\n\n" + trimmed})
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=AI_MODEL,
             messages=messages,
             max_tokens=6000,
             temperature=0.2,
@@ -440,7 +496,7 @@ def batch_conclusion_with_ai(batch):
 
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=AI_MODEL,
             messages=[
                 {"role": "system", "content": BATCH_INSTRUCTIONS},
                 {"role": "user", "content": material},
@@ -527,11 +583,49 @@ def parse_ai_json(raw):
                   "Raw response:\n\n" + raw)
 
 
-def save_results(batch):
+HISTORY_FILE = os.path.join(RESULTS_DIR, "history.json")
+
+
+def load_history():
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _append_history(rid, user, mode, batch):
+    hist = load_history()
+    entry = {
+        "rid": rid,
+        "time": time.strftime("%d %b %Y, %H:%M"),
+        "user": user,
+        "mode": "FS" if mode == "fs" else "WP",
+        "files": [it.get("filename", "") for it in batch.get("files", [])],
+        "findings": sum(len(it.get("result", {}).get("findings", []))
+                        for it in batch.get("files", [])),
+    }
+    hist.insert(0, entry)
+    hist = hist[:30]  # keep the most recent 30 reviews
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(hist, f)
+    except Exception:
+        pass
+
+
+def save_results(batch, user="", mode=""):
     rid = uuid.uuid4().hex[:12]
     with open(os.path.join(RESULTS_DIR, rid + ".json"), "w", encoding="utf-8") as f:
         json.dump(batch, f)
+    _append_history(rid, user, mode, batch)
     return rid
+
+
+def update_results(rid, batch):
+    safe = "".join(c for c in rid if c.isalnum())
+    with open(os.path.join(RESULTS_DIR, safe + ".json"), "w", encoding="utf-8") as f:
+        json.dump(batch, f)
 
 
 def load_results(rid):
@@ -559,34 +653,36 @@ def build_excel(batch):
     wb = Workbook()
     ws = wb.active
     ws.title = "Review Points"
-    ws.append(["File", "No.", "Title", "Severity", "Explanation",
-               "Reference", "Suggested fix"])
+    ws.append(["File", "No.", "Title", "Severity", "Status", "Flagged",
+               "Explanation", "Reference", "Suggested fix"])
     for c in ws[1]:
         c.font = Font(bold=True)
     if batch.get("overall"):
-        ws.append(["BATCH", "-", "OVERALL CONCLUSION", "-",
+        ws.append(["BATCH", "-", "OVERALL CONCLUSION", "-", "", "",
                    batch["overall"].get("overall_conclusion", ""), "", ""])
         for t in batch["overall"].get("common_themes", []):
-            ws.append(["BATCH", "-", "Common theme", "-", t, "", ""])
+            ws.append(["BATCH", "-", "Common theme", "-", "", "", t, "", ""])
         for t in batch["overall"].get("cross_file_observations", []):
-            ws.append(["BATCH", "-", "Cross-file observation", "-", t, "", ""])
+            ws.append(["BATCH", "-", "Cross-file observation", "-", "", "", t, "", ""])
         ws.append([])
     for item in batch["files"]:
         fname = item["filename"]
         if item.get("error"):
-            ws.append([fname, "-", "REVIEW ERROR", "-", item["error"], "-", "-"])
+            ws.append([fname, "-", "REVIEW ERROR", "-", "", "", item["error"], "-", "-"])
             continue
         if item.get("result", {}).get("conclusion"):
-            ws.append([fname, "-", "HEAD-WISE CONCLUSION", "-",
+            ws.append([fname, "-", "HEAD-WISE CONCLUSION", "-", "", "",
                        item["result"]["conclusion"], "", ""])
         for i, f in enumerate(item["result"].get("findings", []), start=1):
             ws.append([fname, i, f.get("title", ""), f.get("severity", ""),
+                       f.get("status", "pending").capitalize(),
+                       "Yes" if f.get("flagged") else "",
                        f.get("explanation", ""), f.get("reference", ""),
                        f.get("fix", "")])
     ws.append([])
     ws.append(["Professional judgement statement:"])
     ws.append([DISCLAIMER])
-    widths = [28, 5, 34, 10, 60, 40, 50]
+    widths = [26, 5, 30, 10, 10, 8, 52, 34, 44]
     for idx, w in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + idx)].width = w
     buf = io.BytesIO()
@@ -639,6 +735,11 @@ def build_pdf(batch):
             story.append(Paragraph(
                 "<b>" + str(i) + ". " + f.get("title", "") + "</b> "
                 "<font color='" + colr + "'>[" + f.get("severity", "") + "]</font>", body))
+            stat = f.get("status", "pending")
+            if stat != "pending" or f.get("flagged"):
+                story.append(Paragraph(
+                    "<i>Status: " + stat.capitalize()
+                    + (" | FLAGGED" if f.get("flagged") else "") + "</i>", body))
             story.append(Paragraph(f.get("explanation", ""), body))
             if f.get("reference"):
                 story.append(Paragraph("<i>Reference: " + f["reference"] + "</i>", body))
@@ -775,6 +876,7 @@ MAIN_PAGE = """
         min-height:64px;resize:vertical;color:#002B49;}
  .instr-label{font-size:12.5px;font-weight:600;color:#3A4A64;margin:16px 0 5px;text-align:left;}
  .instr-hint{font-size:11.5px;color:#5B7083;margin-top:4px;text-align:left;}
+ .anchorsel{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #B7BFC6;border-radius:8px;font-size:13px;font-family:inherit;color:#002B49;background:#fff;}
  .card{background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:24px;
        box-shadow:0 2px 12px rgba(20,35,59,.06);margin-bottom:18px;}
  .notice{background:#F3ECDB;color:#5A4A28;font-size:12.5px;padding:9px 14px;border-radius:8px;margin-bottom:16px;}
@@ -819,6 +921,35 @@ MAIN_PAGE = """
  .dsend{background:#00A09B;color:#fff;border:none;padding:9px 16px;border-radius:6px;
         font-size:12.5px;font-weight:600;cursor:pointer;}
  .dnote{font-size:10.5px;color:#8595A5;margin-top:5px;}
+ .layout{max-width:1200px;margin:0 auto;padding:0 24px;display:flex;gap:20px;align-items:flex-start;}
+ .maincol{flex:1;min-width:0;}
+ .side{width:242px;flex-shrink:0;background:#fff;border:1px solid #D9DDE1;border-radius:12px;
+       padding:14px;position:sticky;top:14px;max-height:calc(100vh - 28px);overflow-y:auto;}
+ @media(max-width:900px){.layout{flex-direction:column;}.side{width:auto;position:static;max-height:none;}}
+ .shead{font-weight:700;font-size:13px;margin-bottom:9px;color:#002B49;}
+ .hitem{display:block;text-decoration:none;border:1px solid #E4E7EB;border-radius:8px;
+        padding:8px 10px;margin-bottom:8px;color:#3A4A64;}
+ .hitem:hover{border-color:#00A09B;background:#F4FAFA;}
+ .hitem.cur{border-color:#00A09B;background:#EAF6F6;}
+ .htime{font-size:10.5px;color:#5B7083;margin-bottom:3px;}
+ .hfiles{font-size:11.5px;color:#0A3556;word-break:break-word;}
+ .hcount{font-size:10.5px;color:#00706C;margin-top:3px;font-weight:600;}
+ .hempty{font-size:12px;color:#5B7083;}
+ .hnote{font-size:10px;color:#8595A5;margin-top:8px;line-height:1.5;}
+ .sbar{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px;}
+ .sb{font-size:12px;font-weight:700;padding:6px 12px;border-radius:16px;background:#EFF2F4;color:#3A4A64;}
+ .sb.p{background:#F3EAD3;color:#B0791C;} .sb.r{background:#E2F2E9;color:#1F6B4F;}
+ .sb.x{background:#F5E1DE;color:#B23A2E;} .sb.fl{background:#E7E4F7;color:#5B4FC0;}
+ .stat-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;align-items:center;}
+ .stbtn{border:1px solid #D9DDE1;background:#fff;color:#5B7083;font-size:11.5px;
+        font-weight:600;padding:5px 11px;border-radius:14px;cursor:pointer;}
+ .stbtn:hover{border-color:#00A09B;}
+ .finding[data-status="pending"] .stbtn.pen{background:#B0791C;color:#fff;border-color:#B0791C;}
+ .finding[data-status="resolved"] .stbtn.res{background:#1F6B4F;color:#fff;border-color:#1F6B4F;}
+ .finding[data-status="rejected"] .stbtn.rej{background:#B23A2E;color:#fff;border-color:#B23A2E;}
+ .finding[data-flag="1"] .stbtn.flg{background:#5B4FC0;color:#fff;border-color:#5B4FC0;}
+ .finding[data-status="resolved"] .ftitle{color:#1F6B4F;}
+ .finding[data-status="rejected"] .fexpl,.finding[data-status="rejected"] .ftitle{opacity:.55;text-decoration:line-through;}
  .dl{display:flex;gap:10px;margin:6px 0 14px;flex-wrap:wrap;}
  .dl a{background:#002B49;color:#fff;text-decoration:none;padding:9px 16px;border-radius:6px;
        font-size:13px;font-weight:600;}
@@ -845,7 +976,8 @@ MAIN_PAGE = """
    <a href="{{ url_for('logout') }}">Log out</a></div>
  </div>
 </div>
-<div class="wrap">
+<div class="layout">
+ <div class="maincol">
  <div class="sub">Baker Tilly - {{ 'Financial Statements review' if mode=='fs' else 'Working-paper review' }} - Stage 4
    &nbsp;|&nbsp; <a href="{{ url_for('choose') }}">Change review type</a></div>
 
@@ -864,6 +996,11 @@ MAIN_PAGE = """
    <textarea class="instr" name="instructions" maxlength="2000"
      placeholder="e.g. Focus on cut-off testing near year end, or: Explain the related-party issue in the revenue file"></textarea>
    <div class="instr-hint">Tell the reviewer what to focus on or ask a question about the files. Leave blank for a full standard review.</div>
+   <div class="instr-label">Cross-check anchor (optional — needs 2+ files)</div>
+   <select class="anchorsel" name="anchor" id="anchorsel">
+     <option value="">No anchor — review each file on its own</option>
+   </select>
+   <div class="instr-hint">If you upload the signed financial statements together with working papers, choose the FS here — every other file is then reviewed AGAINST it: tie-outs, contradictions, impossible dates, omissions.</div>
    <div style="text-align:center;">
      <button class="go" type="submit">Review selected files</button>
      <div class="wait">Reviews take 1-3 minutes per file. Please leave the page open and wait.</div>
@@ -876,6 +1013,13 @@ MAIN_PAGE = """
  {% if batch %}
   <div class="card">
    <h2 style="font-size:17px;margin:0 0 10px;">Review Points</h2>
+   <div class="sbar">
+     <span class="sb" id="sb-t">Total: 0</span>
+     <span class="sb p" id="sb-p">Pending: 0</span>
+     <span class="sb r" id="sb-r">Resolved: 0</span>
+     <span class="sb x" id="sb-x">Rejected: 0</span>
+     <span class="sb fl" id="sb-f">Flagged: 0</span>
+   </div>
    {% if role == 'full' %}
    <div class="dl">
      <a class="x" href="{{ url_for('download_excel', rid=batch_id) }}">Download Excel</a>
@@ -898,7 +1042,7 @@ MAIN_PAGE = """
    {% endif %}
    {% for item in batch['files'] %}
      {% set fidx = loop.index0 %}
-     <div class="filehead">FILE: {{ item['filename'] }}
+     <div class="filehead">FILE: {{ item['filename'] }}{% if item.get('is_anchor') %} <span style="background:#E7E4F7;color:#5B4FC0;font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:10px;vertical-align:middle;">ANCHOR</span>{% endif %}
        {% if item.get('counts') %}
          <span class="cnt h">{{ item['counts']['High'] }} High</span>
          <span class="cnt m">{{ item['counts']['Medium'] }} Med</span>
@@ -916,7 +1060,8 @@ MAIN_PAGE = """
          <div class="conclusion"><b>Head-wise conclusion:</b> {{ item['result']['conclusion'] }}</div>
        {% endif %}
        {% for f in item['result'].get('findings', []) %}
-        <div class="finding">
+        <div class="finding" data-f="{{ fidx }}" data-g="{{ loop.index0 }}"
+             data-status="{{ f.get('status','pending') }}" data-flag="{{ '1' if f.get('flagged') else '0' }}">
          <div class="bar {{ f.get('severity','Low') }}"></div>
          <div class="fbody">
           <div class="ftop"><span class="ftitle">{{ f.get('title','') }}</span>
@@ -924,6 +1069,12 @@ MAIN_PAGE = """
           <div class="fexpl">{{ f.get('explanation','') }}</div>
           {% if f.get('reference') %}<div class="ref">{{ f['reference'] }}</div>{% endif %}
           <div class="fix"><b>Suggested fix:</b> {{ f.get('fix','') }}</div>
+          <div class="stat-row">
+            <button type="button" class="stbtn pen" onclick="setStat(this,'pending')">Pending</button>
+            <button type="button" class="stbtn res" onclick="setStat(this,'resolved')">&#10003; Resolved</button>
+            <button type="button" class="stbtn rej" onclick="setStat(this,'rejected')">&#10007; Rejected</button>
+            <button type="button" class="stbtn flg" onclick="toggleFlag(this)">&#9873; Flag</button>
+          </div>
           <button class="disc-btn" type="button" onclick="discToggle(this)">&#128172; Discuss with AI</button>
           <div class="disc" hidden data-f="{{ fidx }}" data-g="{{ loop.index0 }}">
             <div class="dlog"></div>
@@ -941,6 +1092,24 @@ MAIN_PAGE = """
    <div class="disclaimer"><b>Professional judgement statement:</b> {{ disclaimer }}</div>
   </div>
  {% endif %}
+ </div>
+
+ <aside class="side">
+  <div class="shead">&#128337; Review history</div>
+  {% if history %}
+    {% for h in history %}
+      <a class="hitem{{ ' cur' if batch_id and h['rid'] == batch_id else '' }}"
+         href="{{ url_for('view_report', rid=h['rid']) }}">
+        <div class="htime">{{ h['time'] }} &middot; {{ h['mode'] }} &middot; {{ h['user'] }}</div>
+        <div class="hfiles">{{ h['files']|join(', ') }}</div>
+        <div class="hcount">{{ h['findings'] }} finding{{ '' if h['findings']==1 else 's' }}</div>
+      </a>
+    {% endfor %}
+  {% else %}
+    <div class="hempty">No reviews yet in this server session.</div>
+  {% endif %}
+  <div class="hnote">History and statuses last until the free server restarts or redeploys — download Excel/PDF for a permanent record. Permanent storage arrives with the firm's own server (Stage 5).</div>
+ </aside>
 </div>
 
 <script>
@@ -949,7 +1118,16 @@ const input = document.getElementById('fileinput');
 const list = document.getElementById('filelist');
 const MAXF = {{ maxfiles }};
 
-function showFiles(files){
+function fillAnchor(files){
+  const sel = document.getElementById('anchorsel');
+  if(!sel) return;
+  sel.innerHTML = '<option value="">No anchor — review each file on its own</option>';
+  if(files.length > 1){
+    [...files].forEach(f => { const o = document.createElement('option');
+      o.value = f.name; o.textContent = 'Anchor: ' + f.name; sel.appendChild(o); });
+  }
+}
+function showFiles(files){ fillAnchor(files);
   if(!files || files.length===0){ list.innerHTML=''; return; }
   let html = '';
   const n = Math.min(files.length, MAXF);
@@ -965,6 +1143,47 @@ drop.addEventListener('drop', e => {
 });
 
 const RID = {{ (batch_id or "") | tojson }};
+
+function recount(){
+  const fs = document.querySelectorAll('.finding');
+  let p=0, r=0, x=0, fl=0;
+  fs.forEach(el => {
+    const s = el.dataset.status || 'pending';
+    if(s === 'resolved') r++; else if(s === 'rejected') x++; else p++;
+    if(el.dataset.flag === '1') fl++;
+  });
+  const set = (id, txt) => { const e = document.getElementById(id); if(e) e.textContent = txt; };
+  set('sb-t', 'Total: ' + fs.length);
+  set('sb-p', 'Pending: ' + p);
+  set('sb-r', 'Resolved: ' + r);
+  set('sb-x', 'Rejected: ' + x);
+  set('sb-f', 'Flagged: ' + fl);
+}
+
+function statPost(el, action, onOk){
+  fetch('/status', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({rid: RID, file_index: parseInt(el.dataset.f),
+                          finding_index: parseInt(el.dataset.g), action: action})
+  }).then(r => r.json()).then(d => {
+    if(d.ok){ onOk(); recount(); }
+    else alert(d.error || 'Could not save the change.');
+  }).catch(() => alert('Could not reach the server. Please try again.'));
+}
+
+function setStat(btn, s){
+  const el = btn.closest('.finding');
+  statPost(el, s, () => { el.dataset.status = s; });
+}
+
+function toggleFlag(btn){
+  const el = btn.closest('.finding');
+  const action = el.dataset.flag === '1' ? 'unflag' : 'flag';
+  statPost(el, action, () => { el.dataset.flag = (el.dataset.flag === '1') ? '0' : '1'; });
+}
+
+recount();
 
 function discToggle(btn){
   const d = btn.nextElementSibling;
@@ -1072,8 +1291,8 @@ def home():
     batch_id = None
 
     if request.method == "POST":
-        if not DEEPSEEK_API_KEY:
-            error = "The DeepSeek API key is not set. Add it in Render's Environment Variables."
+        if not AI_KEY_SET:
+            error = "The AI API key is not set. Add it in Render's Environment Variables."
         else:
             uploads = [f for f in request.files.getlist("files") if f and f.filename]
             if not uploads:
@@ -1082,8 +1301,27 @@ def home():
                 uploads = uploads[:MAX_FILES_PER_BATCH]
                 batch = {"files": []}
                 import gc
+                # anchor pre-pass: if the user marked one file (e.g. the signed FS)
+                # as the anchor, extract it first so every other file is reviewed
+                # against it (tie-outs, contradictions, impossible dates, omissions)
+                anchor_name = (request.form.get("anchor") or "").strip()
+                anchor_text = ""
+                if anchor_name and len(uploads) > 1:
+                    for up in uploads:
+                        if up.filename == anchor_name:
+                            try:
+                                d = up.read()
+                                t = extract_text_from_file(up.filename, d) or ""
+                                anchor_text = t[:ANCHOR_CHARS]
+                                del d, t
+                            except Exception:
+                                anchor_text = ""
+                            up.seek(0)
+                            break
                 for up in uploads:
                     entry = {"filename": up.filename}
+                    if anchor_text and up.filename == anchor_name:
+                        entry["is_anchor"] = True
                     try:
                         data = up.read()
                         text = extract_text_from_file(up.filename, data)
@@ -1096,9 +1334,12 @@ def home():
                                               "text layer, perhaps).")
                         else:
                             entry["excerpt"] = text[:3000]
+                            use_anchor = bool(anchor_text) and up.filename != anchor_name
                             result, ai_err = review_with_ai(
                                 text, mode=session.get("mode", "wp"),
-                                user_instructions=request.form.get("instructions", ""))
+                                user_instructions=request.form.get("instructions", ""),
+                                anchor_name=(anchor_name if use_anchor else ""),
+                                anchor_text=(anchor_text if use_anchor else ""))
                             del text  # release the extracted text
                             if ai_err:
                                 entry["error"] = ai_err
@@ -1126,14 +1367,61 @@ def home():
                 for item in batch["files"]:
                     if item.get("excerpt"):
                         item["excerpt"] = item["excerpt"][:3000]
-                batch_id = save_results(batch)
+                batch_id = save_results(batch, user=session.get("user", ""),
+                                        mode=session.get("mode", "wp"))
 
     return render_template_string(MAIN_PAGE, user=session.get("user"),
                                   role=session.get("role"), error=error,
                                   batch=batch, batch_id=batch_id,
                                   maxfiles=MAX_FILES_PER_BATCH,
                                   mode=session.get("mode", "wp"),
+                                  history=load_history(),
                                   disclaimer=DISCLAIMER)
+
+
+@app.route("/report/<rid>")
+@login_required
+def view_report(rid):
+    batch = load_results(rid)
+    error = None
+    if not batch:
+        error = ("This saved report is no longer available. On the free hosting, "
+                 "history is cleared whenever the server restarts or redeploys — "
+                 "the Excel/PDF downloads are the permanent record.")
+    return render_template_string(MAIN_PAGE, user=session.get("user"),
+                                  role=session.get("role"), error=error,
+                                  batch=batch, batch_id=(rid if batch else None),
+                                  maxfiles=MAX_FILES_PER_BATCH,
+                                  mode=session.get("mode", "wp"),
+                                  history=load_history(),
+                                  disclaimer=DISCLAIMER)
+
+
+@app.route("/status", methods=["POST"])
+@login_required
+def set_status():
+    data = request.get_json(silent=True) or {}
+    rid = str(data.get("rid", ""))
+    action = str(data.get("action", ""))
+    batch = load_results(rid)
+    if not batch:
+        return {"error": "This report has expired — statuses can no longer be "
+                         "saved for it. Please run the review again."}, 404
+    try:
+        finding = (batch["files"][int(data.get("file_index", -1))]
+                   ["result"]["findings"][int(data.get("finding_index", -1))])
+    except Exception:
+        return {"error": "That finding could not be found."}, 404
+    if action in ("pending", "resolved", "rejected"):
+        finding["status"] = action
+    elif action == "flag":
+        finding["flagged"] = True
+    elif action == "unflag":
+        finding["flagged"] = False
+    else:
+        return {"error": "Unknown action."}, 400
+    update_results(rid, batch)
+    return {"ok": True}
 
 
 DISCUSS_INSTRUCTIONS = """You are an experienced audit reviewer at an accounting firm, in a follow-up discussion about ONE specific review finding that was raised on a file.
@@ -1153,8 +1441,8 @@ Respond with plain text only (no JSON, no markdown headings)."""
 @app.route("/discuss", methods=["POST"])
 @login_required
 def discuss():
-    if not DEEPSEEK_API_KEY:
-        return {"error": "The DeepSeek API key is not set."}, 500
+    if not AI_KEY_SET:
+        return {"error": "The AI API key is not set."}, 500
     data = request.get_json(silent=True) or {}
     rid = str(data.get("rid", ""))
     question = str(data.get("question", "")).strip()[:2000]
@@ -1199,7 +1487,7 @@ def discuss():
 
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=AI_MODEL,
             messages=messages,
             max_tokens=1200,
             temperature=0.2,
