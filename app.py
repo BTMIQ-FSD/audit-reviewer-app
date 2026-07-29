@@ -122,6 +122,17 @@ HEADS = [
      "cost of sales, administrative expenses, distribution/selling expenses, finance cost, other operating expenses, other income, payroll expense testing"),
 ]
 HEAD_NAMES = {k: n for k, n, _ in HEADS}
+
+# which heads inform each other's review (evidence library cross-feeding)
+RELATED_HEADS = {
+    "nca": ["exp", "eq", "ncl"],   # depreciation, revaluation surplus, borrowing costs
+    "ca":  ["rev", "cl", "exp"],   # debtors<->revenue, advances from customers, ECL charge
+    "eq":  ["nca", "exp"],         # revaluation surplus, profit movement
+    "ncl": ["exp", "nca"],         # finance cost, financed assets
+    "cl":  ["ca", "rev", "exp"],   # advances<->debtors/revenue, accruals
+    "rev": ["ca", "cl"],           # revenue<->debtors, advances from customers
+    "exp": ["nca", "ncl", "rev"],  # depreciation, finance cost, cost vs revenue
+}
 ANCHOR_CHARS = 20000  # how much of the anchor (e.g. signed FS) each review sees
 RESULTS_DIR = os.path.join(tempfile.gettempdir(), "audit_results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -481,7 +492,7 @@ def review_with_ai(document_text, mode="wp", user_instructions="",
 
 
 def head_review_with_ai(document_text, head_key, prior_points,
-                        user_instructions=""):
+                        user_instructions="", related_docs=None):
     """Review one file inside a client head: guard the head, re-check open
     points against new evidence, and raise new findings."""
     head_name = HEAD_NAMES.get(head_key, "")
@@ -504,6 +515,21 @@ def head_review_with_ai(document_text, head_key, prior_points,
             "\"point_updates\" (see below; [] if none), "
             "\"summary\", \"conclusion\"."},
     ]
+    if related_docs:
+        parts = []
+        for d in related_docs:
+            parts.append("--- FROM HEAD \"" + d["head_name"] + "\", FILE \""
+                         + d["name"] + "\" (excerpt) ---\n" + d["excerpt"])
+        messages.append({"role": "system", "content":
+            "RELATED-HEAD DOCUMENTS ALREADY ON RECORD for this client (uploaded "
+            "earlier in other heads). Use them to CROSS-CHECK the document under "
+            "review: tie the interlinked figures (e.g. trade debtors vs revenue, "
+            "advances from customers vs sales/receivables, depreciation vs asset "
+            "schedules, finance cost vs borrowings), and raise a finding for any "
+            "figure, date, party name, or treatment that is INCONSISTENT between "
+            "heads — naming both documents and quoting both figures. Do not "
+            "re-review these related documents themselves; they are context.\n\n"
+            + "\n\n".join(parts)})
     open_points = [p for p in prior_points
                    if p.get("status", "pending") == "pending"][:30]
     if open_points:
@@ -1047,6 +1073,7 @@ CLIENT_HEADS_PAGE = """
  <div><a href="{{ url_for('clients_page') }}">&larr; All clients</a>
   <a href="{{ url_for('logout') }}">Log out</a></div></div>
 <div class="wrap">
+ {% if error %}<div style="background:#FBE9E7;border:1px solid #E5B5AC;color:#8C2F22;border-radius:8px;padding:11px 13px;font-size:13px;margin-bottom:14px;">{{ error }}</div>{% endif %}
  <p style="font-size:13px;color:#5B7083;">Choose a head to review its working papers:</p>
  <div class="grid">
   {% for k, n, e in heads %}
@@ -1059,6 +1086,35 @@ CLIENT_HEADS_PAGE = """
     {% if pts %}<div class="badges"><span class="bp">{{ open }} open</span><span class="br">{{ res }} resolved</span></div>{% endif %}
    </a>
   {% endfor %}
+  {% set cpts = client.get('heads', {}).get('cross', {}).get('points', []) %}
+  {% if cpts %}
+   <a class="hd" style="border-color:#5B4FC0;" href="{{ url_for('head_page', cid=client['cid'], head='cross') }}">
+    <b>&#128279; Cross-head checks</b>
+    <small>Inconsistencies found between heads</small>
+    <div class="badges"><span class="bp">{{ cpts | selectattr('status','equalto','pending') | list | length }} open</span></div>
+   </a>
+  {% endif %}
+ </div>
+
+ <div style="background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:16px 18px;margin-top:18px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+   <b style="font-size:14px;">&#128194; Files on record ({{ client.get('library', []) | length }})</b>
+   <form method="post" action="{{ url_for('client_crosscheck', cid=client['cid']) }}"
+         onsubmit="this.querySelector('button').textContent='Cross-checking... please wait';">
+    <button type="submit" style="background:#5B4FC0;color:#fff;border:none;border-radius:8px;
+      padding:9px 18px;font-weight:600;font-size:13px;cursor:pointer;">&#128279; Run client-wide cross-check</button>
+   </form>
+  </div>
+  {% if client.get('library') %}
+   <div style="margin-top:10px;font-size:12px;color:#3A4A64;line-height:1.8;">
+    {% for d in client['library'] | reverse %}
+      &#128196; {{ d['name'] }} <span style="color:#8595A5;">({{ head_names.get(d['head'], d['head']) }}, {{ d.get('time','') }})</span><br>
+    {% endfor %}
+   </div>
+   <div style="font-size:11px;color:#8595A5;margin-top:6px;">Every reviewed file is remembered here and automatically feeds related heads &mdash; no need to upload the same file in multiple tabs. Cleared if the free server restarts.</div>
+  {% else %}
+   <div style="margin-top:8px;font-size:12px;color:#5B7083;">No files on record yet &mdash; review files in any head and they appear here.</div>
+  {% endif %}
  </div>
 </div></body></html>
 """
@@ -1124,6 +1180,7 @@ HEAD_PAGE = """
  {% if error %}<div class="err">{{ error|safe }}</div>{% endif %}
  {% if okmsg %}<div class="okmsg">{{ okmsg }}</div>{% endif %}
 
+ {% if not is_cross %}
  <div class="card">
   <h2>Upload working papers or additional evidence &mdash; {{ head_name }}</h2>
   <form method="post" enctype="multipart/form-data" onsubmit="document.getElementById('spin').style.display='block'">
@@ -1135,6 +1192,9 @@ HEAD_PAGE = """
   </form>
   <div class="hint">This head covers: {{ head_examples }}. Files belonging to a different head will be redirected to the correct tab. Upload follow-up evidence any time &mdash; the AI re-checks the open points below against it.</div>
  </div>
+ {% else %}
+ <div class="card"><div class="hint">These points were found by the client-wide cross-check across all files on record. Re-run it from the client page after new uploads.</div></div>
+ {% endif %}
 
  {% if points %}
  <div class="card">
@@ -1747,21 +1807,26 @@ def client_heads(cid):
     data = load_client(cid)
     if not data:
         return redirect(url_for("clients_page"))
-    return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS)
+    return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
+                                  error=None, head_names=HEAD_NAMES)
 
 
 @app.route("/client/<cid>/<head>", methods=["GET", "POST"])
 @login_required
 def head_page(cid, head):
     data = load_client(cid)
-    if not data or head not in HEAD_NAMES:
+    is_cross = (head == "cross")
+    if not data or (head not in HEAD_NAMES and not is_cross):
         return redirect(url_for("clients_page"))
-    head_name = HEAD_NAMES[head]
-    head_examples = next(e for k, n, e in HEADS if k == head)
+    head_name = "Cross-head checks" if is_cross else HEAD_NAMES[head]
+    head_examples = ("inconsistencies between heads: debtors vs revenue, advances vs sales, depreciation vs assets, finance cost vs borrowings"
+                     if is_cross else next(e for k, n, e in HEADS if k == head))
     hd = data.setdefault("heads", {}).setdefault(head, {"points": [], "rounds": []})
     error = None
     okmsg = None
 
+    if request.method == "POST" and is_cross:
+        return redirect(url_for("client_heads", cid=cid))
     if request.method == "POST":
         if not AI_KEY_SET:
             error = "The AI API key is not set in Render's Environment Variables."
@@ -1785,8 +1850,20 @@ def head_page(cid, head):
                         if not text.strip():
                             wrongs.append(up.filename + ": no readable text found.")
                             continue
+                        related = []
+                        budget = 3
+                        for d in reversed(data.get("library", [])):
+                            if budget == 0:
+                                break
+                            if d["head"] in RELATED_HEADS.get(head, []):
+                                related.append({"name": d["name"],
+                                                "head_name": HEAD_NAMES.get(d["head"], d["head"]),
+                                                "excerpt": d["excerpt"][:8000]})
+                                budget -= 1
                         result, ai_err = head_review_with_ai(
-                            text, head, hd["points"], instructions)
+                            text, head, hd["points"], instructions,
+                            related_docs=related)
+                        keep_excerpt = text[:12000]
                         del text
                         if ai_err:
                             wrongs.append(up.filename + ": " + ai_err)
@@ -1836,6 +1913,12 @@ def head_page(cid, head):
                         hd["rounds"].append({
                             "time": now, "files": [up.filename],
                             "conclusion": str(result.get("conclusion", ""))[:600]})
+                        lib = data.setdefault("library", [])
+                        lib[:] = [d for d in lib
+                                  if not (d["name"] == up.filename and d["head"] == head)]
+                        lib.append({"name": up.filename, "head": head,
+                                    "excerpt": keep_excerpt, "time": now})
+                        del lib[:-24]
                         done.append(up.filename)
                     except Exception as e:
                         wrongs.append(up.filename + ": could not process ("
@@ -1854,7 +1937,41 @@ def head_page(cid, head):
     return render_template_string(HEAD_PAGE, client=data, head_key=head,
                                   head_name=head_name, head_examples=head_examples,
                                   points=hd["points"], rounds=hd["rounds"],
-                                  error=error, okmsg=okmsg)
+                                  error=error, okmsg=okmsg, is_cross=is_cross)
+
+
+@app.route("/client/<cid>/crosscheck", methods=["POST"])
+@login_required
+def client_crosscheck(cid):
+    data = load_client(cid)
+    if not data:
+        return redirect(url_for("clients_page"))
+    if not AI_KEY_SET:
+        return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
+                                      error="The AI API key is not set.",
+                                      head_names=HEAD_NAMES)
+    result, err = client_cross_check_with_ai(data)
+    if err:
+        return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
+                                      error=err, head_names=HEAD_NAMES)
+    hd = data.setdefault("heads", {}).setdefault("cross", {"points": [], "rounds": []})
+    now = time.strftime("%d %b %Y, %H:%M")
+    next_id = max([p["id"] for p in hd["points"]], default=0) + 1
+    for f in result.get("findings", []):
+        hd["points"].append({
+            "id": next_id, "title": str(f.get("title", ""))[:200],
+            "explanation": str(f.get("explanation", ""))[:1500],
+            "reference": str(f.get("reference", ""))[:300],
+            "severity": f.get("severity", "Medium"),
+            "fix": str(f.get("fix", ""))[:800],
+            "status": "pending", "flagged": False,
+            "time": now, "source": "client-wide cross-check"})
+        next_id += 1
+    hd["rounds"].append({"time": now,
+                         "files": [d["name"] for d in data.get("library", [])],
+                         "conclusion": str(result.get("conclusion", ""))[:600]})
+    save_client(data)
+    return redirect(url_for("head_page", cid=cid, head="cross"))
 
 
 @app.route("/hstatus", methods=["POST"])
@@ -2028,6 +2145,59 @@ def set_status():
         return {"error": "Unknown action."}, 400
     update_results(rid, batch)
     return {"ok": True}
+
+
+def client_cross_check_with_ai(data):
+    """One pass across everything on record for a client: hunt inter-head
+    inconsistencies (figures, parties, dates, treatments)."""
+    lib = data.get("library", [])[:12]
+    if len(lib) < 2:
+        return None, ("At least two files (in different heads) must be on record "
+                      "before a client-wide cross-check can run.")
+    parts = []
+    for d in lib:
+        parts.append("--- HEAD \"" + HEAD_NAMES.get(d["head"], d["head"])
+                     + "\", FILE \"" + d["name"] + "\" (excerpt) ---\n"
+                     + d["excerpt"][:6000])
+    open_pts = []
+    for k, hd in data.get("heads", {}).items():
+        for p in hd.get("points", []):
+            if p.get("status", "pending") == "pending":
+                open_pts.append(HEAD_NAMES.get(k, k) + " #" + str(p["id"]) + ": "
+                                + p.get("title", ""))
+    messages = [
+        {"role": "system", "content":
+            "You are an experienced audit reviewer performing a CLIENT-WIDE "
+            "CROSS-CHECK across the working papers of different audit heads of one "
+            "client. You are given excerpts from documents filed under different "
+            "heads. Your ONLY job is to find issues BETWEEN heads: interlinked "
+            "figures that do not tie (debtors vs revenue, advances vs sales, "
+            "depreciation vs asset schedules, finance cost vs borrowings, profit "
+            "vs equity movement), the same party or transaction treated "
+            "inconsistently in different heads, dates that conflict, and items "
+            "present in one head but unexplainably missing where they should also "
+            "appear. Do NOT repeat single-document issues. Quote both figures and "
+            "name both files in every finding. Report each issue once, most "
+            "important first, maximum 15 findings, plain English. "
+            "Return JSON: {\"findings\": [{\"title\", \"explanation\", "
+            "\"reference\", \"severity\": \"High|Medium|Low|Factual\", "
+            "\"fix\"}], \"summary\", \"conclusion\"}. Return ONLY the JSON."},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY:\n\n" + KNOWLEDGE_BASE},
+        {"role": "user", "content":
+            "DOCUMENTS ON RECORD:\n\n" + "\n\n".join(parts)
+            + ("\n\nOPEN REVIEW POINTS ACROSS HEADS (context, do not repeat):\n"
+               + "\n".join(open_pts[:40]) if open_pts else "")},
+    ]
+    try:
+        response = client.chat.completions.create(
+            model=AI_MODEL, messages=messages,
+            max_tokens=5000, temperature=0.2)
+    except Exception as e:
+        err_name = type(e).__name__
+        if "Timeout" in err_name or "timeout" in str(e).lower():
+            return None, "The AI took too long. Please try again."
+        return None, "The AI could not be reached. Details: " + err_name
+    return parse_ai_json(response.choices[0].message.content.strip())
 
 
 DISCUSS_INSTRUCTIONS = """You are an experienced audit reviewer at an accounting firm, in a follow-up discussion about ONE specific review finding that was raised on a file.
