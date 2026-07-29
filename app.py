@@ -103,6 +103,25 @@ else:
 
 MAX_FILES_PER_BATCH = 8
 MAX_EXTRACT_CHARS = 120000
+
+# Head-wise segregation for Complete Client Review
+HEADS = [
+    ("nca", "Non-current assets",
+     "property plant and equipment, operating fixed assets, depreciation, CWIP/capital work in progress, intangibles, long-term investments, long-term deposits and advances, right-of-use assets"),
+    ("ca", "Current assets",
+     "inventories/stock in trade, stores and spares, trade receivables/debtors, advances and prepayments, other receivables, tax refunds due, short-term investments, cash and bank balances"),
+    ("eq", "Equity",
+     "share capital, reserves, unappropriated profit/retained earnings, revaluation surplus, statement of changes in equity"),
+    ("ncl", "Non-current liabilities",
+     "long-term financing/loans, lease liabilities, deferred taxation liability, long-term provisions, staff retirement benefits/gratuity"),
+    ("cl", "Current liabilities",
+     "trade and other payables/creditors, accrued liabilities and mark-up, short-term borrowings, current portion of long-term debt, taxes payable"),
+    ("rev", "Revenue",
+     "sales, local and export revenue, revenue recognition and cut-off, rebates and discounts, contract assets and liabilities"),
+    ("exp", "Expenses and other income",
+     "cost of sales, administrative expenses, distribution/selling expenses, finance cost, other operating expenses, other income, payroll expense testing"),
+]
+HEAD_NAMES = {k: n for k, n, _ in HEADS}
 ANCHOR_CHARS = 20000  # how much of the anchor (e.g. signed FS) each review sees
 RESULTS_DIR = os.path.join(tempfile.gettempdir(), "audit_results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -461,6 +480,65 @@ def review_with_ai(document_text, mode="wp", user_instructions="",
     return parse_ai_json(raw)
 
 
+def head_review_with_ai(document_text, head_key, prior_points,
+                        user_instructions=""):
+    """Review one file inside a client head: guard the head, re-check open
+    points against new evidence, and raise new findings."""
+    head_name = HEAD_NAMES.get(head_key, "")
+    examples = next((e for k, n, e in HEADS if k == head_key), "")
+    all_heads = "; ".join(n + " (" + e + ")" for k, n, e in HEADS)
+    trimmed = document_text[:MAX_EXTRACT_CHARS]
+    messages = [
+        {"role": "system", "content": REVIEWER_INSTRUCTIONS},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY (check against these texts):\n\n" + KNOWLEDGE_BASE},
+        {"role": "system", "content":
+            "HEAD CONTEXT: this review belongs to the head \"" + head_name + "\" "
+            "(covers: " + examples + ").\n\n"
+            "STEP 0 - HEAD CHECK (do this first): decide which head the document "
+            "belongs to, from this list: " + all_heads + ". If it clearly belongs "
+            "to a DIFFERENT head than \"" + head_name + "\", return ONLY this JSON "
+            "and nothing else: {\"wrong_head\": \"<name of the head it belongs to>\"}. "
+            "If it belongs here (or is genuinely ambiguous), proceed with the review.\n\n"
+            "OUTPUT FORMAT OVERRIDE: return a JSON object with keys: "
+            "\"findings\" (as instructed above, NEW issues only), "
+            "\"point_updates\" (see below; [] if none), "
+            "\"summary\", \"conclusion\"."},
+    ]
+    open_points = [p for p in prior_points
+                   if p.get("status", "pending") == "pending"][:30]
+    if open_points:
+        listing = json.dumps([{"id": p["id"], "title": p.get("title", ""),
+                               "explanation": (p.get("explanation", "") or "")[:200]}
+                              for p in open_points])
+        messages.append({"role": "system", "content":
+            "PRIOR OPEN REVIEW POINTS for this head:\n" + listing + "\n\n"
+            "The new document may contain evidence or corrections for these. For "
+            "each prior point this document speaks to, add an entry to "
+            "\"point_updates\": {\"id\": <id>, \"resolution\": \"resolved\" or "
+            "\"still_open\", \"comment\": \"short plain-English reason, citing what "
+            "the new document shows or still lacks\"}. Judge honestly: say resolved "
+            "only when the evidence genuinely settles the point. Do NOT repeat these "
+            "prior points inside \"findings\" - findings are for NEW issues only."})
+    if user_instructions.strip():
+        messages.append({"role": "system", "content":
+            "SPECIFIC INSTRUCTIONS FROM THE REVIEWER (follow these):\n\n"
+            + user_instructions.strip()[:2000]})
+    messages.append({"role": "user", "content":
+        "Here is the working paper to review:\n\n" + trimmed})
+    try:
+        response = client.chat.completions.create(
+            model=AI_MODEL, messages=messages,
+            max_tokens=6000, temperature=0.2)
+    except Exception as e:
+        err_name = type(e).__name__
+        if "Timeout" in err_name or "timeout" in str(e).lower():
+            return None, ("The AI service took too long to respond for this file. "
+                          "Please try again in a few minutes.")
+        return None, ("The AI service could not be reached. Details: " + err_name)
+    raw = response.choices[0].message.content.strip()
+    return parse_ai_json(raw)
+
+
 
 
 BATCH_INSTRUCTIONS = """You are an experienced audit reviewer. You are given the review results for a BATCH of related audit files (working papers and possibly their supporting evidence such as confirmations, invoices, schedules).
@@ -626,6 +704,40 @@ def update_results(rid, batch):
     safe = "".join(c for c in rid if c.isalnum())
     with open(os.path.join(RESULTS_DIR, safe + ".json"), "w", encoding="utf-8") as f:
         json.dump(batch, f)
+
+
+CLIENTS_FILE = os.path.join(RESULTS_DIR, "clients.json")
+
+
+def load_clients():
+    try:
+        with open(CLIENTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_clients(clients):
+    with open(CLIENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(clients, f)
+
+
+def client_path(cid):
+    safe = "".join(c for c in cid if c.isalnum())
+    return os.path.join(RESULTS_DIR, "client_" + safe + ".json")
+
+
+def load_client(cid):
+    try:
+        with open(client_path(cid), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_client(data):
+    with open(client_path(data["cid"]), "w", encoding="utf-8") as f:
+        json.dump(data, f)
 
 
 def load_results(rid):
@@ -818,6 +930,284 @@ CHOOSE_PAGE = """
  </div>
  <div class="foot">Every AI output is a draft — final professional judgement rests with the audit team.</div>
 </div></body></html>
+"""
+
+
+WP_CHOICE_PAGE = """
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Working-paper review : choose scope</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0c1b34;margin:0;
+      min-height:100vh;display:grid;place-items:center;color:#fff;}
+ .stage{width:100%;max-width:660px;padding:40px 20px;text-align:center;}
+ h1{font-size:22px;font-weight:600;margin:0 0 4px;}
+ .sub{color:#9fb3cc;font-size:14px;margin-bottom:28px;}
+ .choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;max-width:540px;margin:0 auto;}
+ .choice{display:block;text-decoration:none;background:rgba(255,255,255,.05);
+         border:1px solid rgba(94,234,212,.18);border-radius:12px;padding:26px 20px;
+         transition:transform .25s,border-color .25s,background .25s;}
+ .choice:hover{transform:translateY(-6px);border-color:#2dd4bf;background:rgba(45,212,191,.12);}
+ .cico{font-size:28px;margin-bottom:10px;}
+ .ctitle{color:#fff;font-size:16px;font-weight:600;margin-bottom:6px;}
+ .cdesc{color:#9fb3cc;font-size:12.5px;line-height:1.6;}
+ .back{display:inline-block;margin-top:24px;color:#5eead4;font-size:13px;text-decoration:none;}
+</style></head><body>
+<div class="stage">
+ <h1>Working-paper review</h1>
+ <div class="sub">Choose the scope</div>
+ <div class="choices">
+  <a class="choice" href="{{ url_for('clients_page') }}">
+   <div class="cico">&#128193;</div>
+   <div class="ctitle">Complete client review</div>
+   <div class="cdesc">A workspace per client with head-wise tabs (assets, liabilities, equity, revenue, expenses) and running review points</div>
+  </a>
+  <a class="choice" href="{{ url_for('home') }}">
+   <div class="cico">&#9889;</div>
+   <div class="ctitle">General review</div>
+   <div class="cdesc">Quick one-off review of any files, with optional cross-check anchor</div>
+  </a>
+ </div>
+ <a class="back" href="{{ url_for('choose') }}">&larr; Back</a>
+</div></body></html>
+"""
+
+CLIENTS_PAGE = """
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clients : Complete client review</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#ECEEF0;margin:0;color:#002B49;}
+ .band{background:#0c1b34;padding:16px 28px;margin-bottom:20px;color:#fff;
+       display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;}
+ .band h1{font-size:18px;margin:0;}
+ .band a{color:#5eead4;font-size:12.5px;text-decoration:none;margin-left:12px;}
+ .wrap{max-width:720px;margin:0 auto;padding:0 24px 40px;}
+ .card{background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:20px;margin-bottom:16px;}
+ .addrow{display:flex;gap:10px;}
+ .addrow input{flex:1;padding:10px 12px;border:1px solid #B7BFC6;border-radius:8px;font-size:14px;}
+ .addrow button{background:#00A09B;color:#fff;border:none;border-radius:8px;padding:10px 20px;
+       font-weight:600;font-size:14px;cursor:pointer;}
+ .cl{display:block;text-decoration:none;color:#002B49;border:1px solid #E4E7EB;border-radius:10px;
+     padding:14px 16px;margin-bottom:10px;font-weight:600;}
+ .cl:hover{border-color:#00A09B;background:#F4FAFA;}
+ .cl small{display:block;color:#5B7083;font-weight:400;font-size:11.5px;margin-top:3px;}
+ .note{font-size:11px;color:#8595A5;line-height:1.5;}
+ .err{background:#FBE9E7;border:1px solid #E5B5AC;color:#8C2F22;border-radius:8px;
+      padding:10px 12px;font-size:13px;margin-bottom:12px;}
+</style></head><body>
+<div class="band"><h1>Complete client review &mdash; Clients</h1>
+ <div><span style="font-size:12.5px;color:#9fb3cc;">Signed in as <b style="color:#fff;">{{ user }}</b></span>
+  <a href="{{ url_for('wp_choice') }}">&larr; Back</a>
+  <a href="{{ url_for('logout') }}">Log out</a></div></div>
+<div class="wrap">
+ {% if error %}<div class="err">{{ error }}</div>{% endif %}
+ <div class="card">
+  <form method="post" class="addrow">
+   <input name="client_name" maxlength="80" placeholder="New client name, e.g. Gohar Textile Mills (Pvt) Ltd - FY2025" required>
+   <button type="submit">Add client</button>
+  </form>
+ </div>
+ <div class="card">
+  {% if clients %}
+    {% for c in clients %}
+      <a class="cl" href="{{ url_for('client_heads', cid=c['cid']) }}">&#128193; {{ c['name'] }}
+        <small>Created {{ c['created'] }}</small></a>
+    {% endfor %}
+  {% else %}
+    <div style="color:#5B7083;font-size:13.5px;">No clients yet &mdash; add your first one above.</div>
+  {% endif %}
+ </div>
+ <div class="note">Use sample / training data only on this free hosting. Client workspaces are kept on the free server and are cleared if it restarts or redeploys &mdash; download reports for permanent records. Permanent storage arrives with the firm's own server (Stage 5).</div>
+</div></body></html>
+"""
+
+CLIENT_HEADS_PAGE = """
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ client['name'] }} : heads</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#ECEEF0;margin:0;color:#002B49;}
+ .band{background:#0c1b34;padding:16px 28px;margin-bottom:20px;color:#fff;
+       display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;}
+ .band h1{font-size:17px;margin:0;}
+ .band a{color:#5eead4;font-size:12.5px;text-decoration:none;margin-left:12px;}
+ .wrap{max-width:820px;margin:0 auto;padding:0 24px 40px;}
+ .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;}
+ .hd{display:block;text-decoration:none;color:#002B49;background:#fff;border:1px solid #D9DDE1;
+     border-radius:12px;padding:18px 16px;}
+ .hd:hover{border-color:#00A09B;background:#F4FAFA;}
+ .hd b{display:block;font-size:14.5px;margin-bottom:6px;}
+ .hd small{color:#5B7083;font-size:11px;line-height:1.5;display:block;}
+ .badges{margin-top:9px;font-size:10.5px;font-weight:700;}
+ .badges span{padding:2px 8px;border-radius:10px;margin-right:5px;display:inline-block;}
+ .bp{background:#F3EAD3;color:#B0791C;} .br{background:#E2F2E9;color:#1F6B4F;}
+</style></head><body>
+<div class="band"><h1>&#128193; {{ client['name'] }}</h1>
+ <div><a href="{{ url_for('clients_page') }}">&larr; All clients</a>
+  <a href="{{ url_for('logout') }}">Log out</a></div></div>
+<div class="wrap">
+ <p style="font-size:13px;color:#5B7083;">Choose a head to review its working papers:</p>
+ <div class="grid">
+  {% for k, n, e in heads %}
+   {% set pts = client.get('heads', {}).get(k, {}).get('points', []) %}
+   {% set open = pts | selectattr('status', 'equalto', 'pending') | list | length %}
+   {% set res = pts | selectattr('status', 'equalto', 'resolved') | list | length %}
+   <a class="hd" href="{{ url_for('head_page', cid=client['cid'], head=k) }}">
+    <b>{{ loop.index }}. {{ n }}</b>
+    <small>{{ e[:90] }}...</small>
+    {% if pts %}<div class="badges"><span class="bp">{{ open }} open</span><span class="br">{{ res }} resolved</span></div>{% endif %}
+   </a>
+  {% endfor %}
+ </div>
+</div></body></html>
+"""
+
+HEAD_PAGE = """
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ head_name }} : {{ client['name'] }}</title>
+<style>
+ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#ECEEF0;margin:0;color:#002B49;}
+ .band{background:#0c1b34;padding:14px 28px;margin-bottom:18px;color:#fff;
+       display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;}
+ .band h1{font-size:16px;margin:0;}
+ .band a{color:#5eead4;font-size:12.5px;text-decoration:none;margin-left:12px;}
+ .wrap{max-width:900px;margin:0 auto;padding:0 24px 40px;}
+ .card{background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:18px 20px;margin-bottom:16px;}
+ .err{background:#FBE9E7;border:1px solid #E5B5AC;color:#8C2F22;border-radius:8px;
+      padding:12px 14px;font-size:13.5px;margin-bottom:14px;}
+ .err a{color:#8C2F22;font-weight:700;}
+ .okmsg{background:#E2F2E9;border:1px solid #B5D8C4;color:#1F6B4F;border-radius:8px;
+      padding:12px 14px;font-size:13.5px;margin-bottom:14px;}
+ input[type=file]{font-size:13px;}
+ .instr{width:100%;box-sizing:border-box;margin-top:10px;padding:10px 12px;border:1px solid #B7BFC6;
+        border-radius:8px;font-size:13px;font-family:inherit;min-height:52px;resize:vertical;}
+ .go{background:#00A09B;color:#fff;border:none;border-radius:8px;padding:11px 22px;
+     font-weight:600;font-size:14px;cursor:pointer;margin-top:12px;}
+ .hint{font-size:11.5px;color:#5B7083;margin-top:8px;line-height:1.5;}
+ .sbar{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px;}
+ .sb{font-size:12px;font-weight:700;padding:6px 12px;border-radius:16px;background:#EFF2F4;color:#3A4A64;}
+ .sb.p{background:#F3EAD3;color:#B0791C;} .sb.r{background:#E2F2E9;color:#1F6B4F;}
+ .sb.x{background:#F5E1DE;color:#B23A2E;} .sb.fl{background:#E7E4F7;color:#5B4FC0;}
+ .pt{border:1px solid #E4E7EB;border-radius:10px;padding:14px 16px;margin-bottom:12px;}
+ .ptop{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;}
+ .ptitle{font-weight:700;font-size:14px;}
+ .sev{font-size:10.5px;font-weight:700;padding:2px 9px;border-radius:10px;}
+ .sev.High{background:#F5E1DE;color:#B23A2E;} .sev.Medium{background:#F3EAD3;color:#B0791C;}
+ .sev.Low{background:#EFF2F4;color:#3A4A64;} .sev.Factual{background:#E4EFF9;color:#0A3556;}
+ .pexpl{font-size:13px;color:#3A4A64;margin:7px 0;line-height:1.6;}
+ .pref{font-family:ui-monospace,monospace;font-size:11.5px;background:#EAF6F6;color:#00706C;
+       border-left:3px solid #00A09B;padding:6px 9px;border-radius:4px;margin:7px 0;}
+ .pfix{font-size:12.5px;color:#3A4A64;background:#F7F9F9;border:1px solid #eee;border-radius:6px;padding:7px 10px;}
+ .aiu{font-size:12px;border-radius:6px;padding:7px 10px;margin-top:8px;}
+ .aiu.res{background:#E2F2E9;color:#1F6B4F;border:1px solid #B5D8C4;}
+ .aiu.open{background:#FBF3E3;color:#8A5E12;border:1px solid #E8D3A3;}
+ .meta{font-size:10.5px;color:#8595A5;margin-top:7px;}
+ .stat-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;}
+ .stbtn{border:1px solid #D9DDE1;background:#fff;color:#5B7083;font-size:11.5px;
+        font-weight:600;padding:5px 11px;border-radius:14px;cursor:pointer;}
+ .pt[data-status="pending"] .stbtn.pen{background:#B0791C;color:#fff;border-color:#B0791C;}
+ .pt[data-status="resolved"] .stbtn.res{background:#1F6B4F;color:#fff;border-color:#1F6B4F;}
+ .pt[data-status="rejected"] .stbtn.rej{background:#B23A2E;color:#fff;border-color:#B23A2E;}
+ .pt[data-flag="1"] .stbtn.flg{background:#5B4FC0;color:#fff;border-color:#5B4FC0;}
+ .pt[data-status="rejected"] .ptitle,.pt[data-status="rejected"] .pexpl{opacity:.5;text-decoration:line-through;}
+ .round{font-size:12px;color:#5B7083;border-left:3px solid #D9DDE1;padding:4px 10px;margin-bottom:8px;}
+ h2{font-size:16px;margin:0 0 12px;}
+ .spin{display:none;color:#00706C;font-size:13px;margin-top:10px;font-weight:600;}
+</style></head><body>
+<div class="band"><h1>{{ client['name'] }} &rsaquo; {{ head_name }}</h1>
+ <div><a href="{{ url_for('client_heads', cid=client['cid']) }}">&larr; Back to heads</a>
+  <a href="{{ url_for('clients_page') }}">All clients</a>
+  <a href="{{ url_for('logout') }}">Log out</a></div></div>
+<div class="wrap">
+ {% if error %}<div class="err">{{ error|safe }}</div>{% endif %}
+ {% if okmsg %}<div class="okmsg">{{ okmsg }}</div>{% endif %}
+
+ <div class="card">
+  <h2>Upload working papers or additional evidence &mdash; {{ head_name }}</h2>
+  <form method="post" enctype="multipart/form-data" onsubmit="document.getElementById('spin').style.display='block'">
+   <input type="file" name="files" multiple accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt">
+   <textarea class="instr" name="instructions" maxlength="2000"
+     placeholder="Optional instructions, e.g. This file answers point 3 - the missing conclusion has been added, please re-check"></textarea>
+   <button class="go" type="submit">Review in this head</button>
+   <div class="spin" id="spin">Reviewing... this can take 1-3 minutes per file. Please keep the page open.</div>
+  </form>
+  <div class="hint">This head covers: {{ head_examples }}. Files belonging to a different head will be redirected to the correct tab. Upload follow-up evidence any time &mdash; the AI re-checks the open points below against it.</div>
+ </div>
+
+ {% if points %}
+ <div class="card">
+  <h2>Review points &mdash; {{ head_name }}</h2>
+  <div class="sbar">
+    <span class="sb" id="sb-t"></span><span class="sb p" id="sb-p"></span>
+    <span class="sb r" id="sb-r"></span><span class="sb x" id="sb-x"></span>
+    <span class="sb fl" id="sb-f"></span>
+  </div>
+  {% for p in points %}
+   <div class="pt" data-pid="{{ p['id'] }}" data-status="{{ p.get('status','pending') }}"
+        data-flag="{{ '1' if p.get('flagged') else '0' }}">
+    <div class="ptop"><span class="ptitle">{{ p['id'] }}. {{ p.get('title','') }}</span>
+      <span class="sev {{ p.get('severity','Low') }}">{{ p.get('severity','') }}</span></div>
+    <div class="pexpl">{{ p.get('explanation','') }}</div>
+    {% if p.get('reference') %}<div class="pref">{{ p['reference'] }}</div>{% endif %}
+    {% if p.get('fix') %}<div class="pfix"><b>Suggested fix:</b> {{ p['fix'] }}</div>{% endif %}
+    {% if p.get('ai_update') %}
+      <div class="aiu {{ 'res' if p['ai_update'].get('resolution')=='resolved' else 'open' }}">
+        <b>AI re-check ({{ p['ai_update'].get('time','') }}):</b>
+        {{ 'Appears RESOLVED by the new evidence' if p['ai_update'].get('resolution')=='resolved' else 'Still OPEN' }}
+        &mdash; {{ p['ai_update'].get('comment','') }}
+        {% if p['ai_update'].get('resolution')=='resolved' %} (Confirm by clicking Resolved.){% endif %}
+      </div>
+    {% endif %}
+    <div class="meta">Raised {{ p.get('time','') }} from {{ p.get('source','') }}</div>
+    <div class="stat-row">
+      <button type="button" class="stbtn pen" onclick="hstat(this,'pending')">Pending</button>
+      <button type="button" class="stbtn res" onclick="hstat(this,'resolved')">&#10003; Resolved</button>
+      <button type="button" class="stbtn rej" onclick="hstat(this,'rejected')">&#10007; Rejected</button>
+      <button type="button" class="stbtn flg" onclick="hflag(this)">&#9873; Flag</button>
+    </div>
+   </div>
+  {% endfor %}
+ </div>
+ {% endif %}
+
+ {% if rounds %}
+ <div class="card">
+  <h2>Review rounds in this head</h2>
+  {% for r in rounds|reverse %}
+    <div class="round"><b>{{ r.get('time','') }}</b> &mdash; {{ r.get('files',[])|join(', ') }}
+      {% if r.get('conclusion') %}<br>{{ r['conclusion'] }}{% endif %}</div>
+  {% endfor %}
+ </div>
+ {% endif %}
+</div>
+<script>
+const CID = {{ client['cid'] | tojson }};
+const HEAD = {{ head_key | tojson }};
+function hcount(){
+  const ps = document.querySelectorAll('.pt');
+  let p=0,r=0,x=0,fl=0;
+  ps.forEach(el=>{const s=el.dataset.status||'pending';
+    if(s==='resolved')r++;else if(s==='rejected')x++;else p++;
+    if(el.dataset.flag==='1')fl++;});
+  const set=(id,t)=>{const e=document.getElementById(id);if(e)e.textContent=t;};
+  set('sb-t','Total: '+ps.length); set('sb-p','Open/Pending: '+p);
+  set('sb-r','Resolved/Closed: '+r); set('sb-x','Rejected: '+x); set('sb-f','Flagged: '+fl);
+}
+function hpost(el, action, ok){
+  fetch('/hstatus',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({cid:CID,head:HEAD,pid:parseInt(el.dataset.pid),action:action})})
+   .then(r=>r.json()).then(d=>{ if(d.ok){ok();hcount();} else alert(d.error||'Could not save.'); })
+   .catch(()=>alert('Could not reach the server.'));
+}
+function hstat(btn,s){ const el=btn.closest('.pt'); hpost(el,s,()=>{el.dataset.status=s;}); }
+function hflag(btn){ const el=btn.closest('.pt');
+  const a=el.dataset.flag==='1'?'unflag':'flag';
+  hpost(el,a,()=>{el.dataset.flag=el.dataset.flag==='1'?'0':'1';}); }
+hcount();
+</script>
+</body></html>
 """
 
 LOGIN_PAGE = """
@@ -1118,28 +1508,66 @@ const input = document.getElementById('fileinput');
 const list = document.getElementById('filelist');
 const MAXF = {{ maxfiles }};
 
-function fillAnchor(files){
+// the basket: files accumulate across any mix of drags and browses
+let picked = [];
+
+function fillAnchor(){
   const sel = document.getElementById('anchorsel');
   if(!sel) return;
+  const keep = sel.value;
   sel.innerHTML = '<option value="">No anchor — review each file on its own</option>';
-  if(files.length > 1){
-    [...files].forEach(f => { const o = document.createElement('option');
+  if(picked.length > 1){
+    picked.forEach(f => { const o = document.createElement('option');
       o.value = f.name; o.textContent = 'Anchor: ' + f.name; sel.appendChild(o); });
+    if([...sel.options].some(o => o.value === keep)) sel.value = keep;
   }
 }
-function showFiles(files){ fillAnchor(files);
-  if(!files || files.length===0){ list.innerHTML=''; return; }
+
+function syncInput(){
+  const dt = new DataTransfer();
+  picked.forEach(f => dt.items.add(f));
+  input.files = dt.files;   // what actually gets submitted with the form
+  renderList();
+  fillAnchor();
+}
+
+function renderList(){
+  if(picked.length === 0){ list.innerHTML = ''; return; }
   let html = '';
-  const n = Math.min(files.length, MAXF);
-  for(let i=0;i<n;i++){ html += '&#128196; ' + files[i].name + '<br>'; }
-  if(files.length > MAXF){ html += '<i>(only the first ' + MAXF + ' will be reviewed)</i>'; }
+  picked.forEach((f, i) => {
+    html += '<div>&#128196; ' + f.name.replace(/</g,'&lt;')
+          + ' <a href="#" onclick="removeFile(' + i + ');return false;"'
+          + ' style="color:#B23A2E;font-weight:700;text-decoration:none;margin-left:6px;"'
+          + ' title="Remove this file">&#10005;</a></div>';
+  });
+  html += '<div style="margin-top:6px;"><b>' + picked.length + ' of ' + MAXF + ' files</b>'
+        + (picked.length > 1
+           ? ' &nbsp;<a href="#" onclick="clearFiles();return false;" style="color:#5B7083;">clear all</a>'
+           : '')
+        + '</div>';
   list.innerHTML = html;
 }
-input.addEventListener('change', () => showFiles(input.files));
+
+function removeFile(i){ picked.splice(i, 1); syncInput(); }
+function clearFiles(){ picked = []; syncInput(); }
+
+function addFiles(files){
+  let skippedDup = 0, hitCap = false;
+  for(const f of files){
+    if(picked.length >= MAXF){ hitCap = true; break; }
+    if(picked.some(p => p.name === f.name && p.size === f.size)){ skippedDup++; continue; }
+    picked.push(f);
+  }
+  syncInput();
+  if(hitCap) alert('Maximum ' + MAXF + ' files per batch — extra files were not added.');
+  else if(skippedDup) alert(skippedDup + ' file(s) skipped: already in the list.');
+}
+
+input.addEventListener('change', () => { addFiles(input.files); });
 ['dragover','dragenter'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
 ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
 drop.addEventListener('drop', e => {
-  if(e.dataTransfer.files.length){ input.files = e.dataTransfer.files; showFiles(input.files); }
+  if(e.dataTransfer.files.length){ addFiles(e.dataTransfer.files); }
 });
 
 const RID = {{ (batch_id or "") | tojson }};
@@ -1278,7 +1706,185 @@ def select_mode(mode):
     if mode not in ("fs", "wp"):
         return redirect(url_for("choose"))
     session["mode"] = mode
+    if mode == "wp":
+        return redirect(url_for("wp_choice"))
     return redirect(url_for("home"))
+
+
+@app.route("/wp-choice")
+@login_required
+def wp_choice():
+    session["mode"] = "wp"
+    return render_template_string(WP_CHOICE_PAGE)
+
+
+@app.route("/clients", methods=["GET", "POST"])
+@login_required
+def clients_page():
+    error = None
+    if request.method == "POST":
+        name = (request.form.get("client_name") or "").strip()[:80]
+        if not name:
+            error = "Please enter a client name."
+        else:
+            clients = load_clients()
+            if any(c["name"].lower() == name.lower() for c in clients):
+                error = "A client with this name already exists."
+            else:
+                cid = uuid.uuid4().hex[:10]
+                clients.insert(0, {"cid": cid, "name": name,
+                                   "created": time.strftime("%d %b %Y")})
+                save_clients(clients)
+                save_client({"cid": cid, "name": name, "heads": {}})
+                return redirect(url_for("client_heads", cid=cid))
+    return render_template_string(CLIENTS_PAGE, clients=load_clients(),
+                                  user=session.get("user"), error=error)
+
+
+@app.route("/client/<cid>")
+@login_required
+def client_heads(cid):
+    data = load_client(cid)
+    if not data:
+        return redirect(url_for("clients_page"))
+    return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS)
+
+
+@app.route("/client/<cid>/<head>", methods=["GET", "POST"])
+@login_required
+def head_page(cid, head):
+    data = load_client(cid)
+    if not data or head not in HEAD_NAMES:
+        return redirect(url_for("clients_page"))
+    head_name = HEAD_NAMES[head]
+    head_examples = next(e for k, n, e in HEADS if k == head)
+    hd = data.setdefault("heads", {}).setdefault(head, {"points": [], "rounds": []})
+    error = None
+    okmsg = None
+
+    if request.method == "POST":
+        if not AI_KEY_SET:
+            error = "The AI API key is not set in Render's Environment Variables."
+        else:
+            uploads = [f for f in request.files.getlist("files") if f and f.filename]
+            if not uploads:
+                error = "Please choose at least one file."
+            else:
+                uploads = uploads[:MAX_FILES_PER_BATCH]
+                instructions = request.form.get("instructions", "")
+                wrongs, done, new_pts, resolved_n = [], [], 0, 0
+                import gc
+                for up in uploads:
+                    try:
+                        raw = up.read()
+                        text = extract_text_from_file(up.filename, raw)
+                        del raw
+                        if text is None:
+                            wrongs.append(up.filename + ": unsupported file type.")
+                            continue
+                        if not text.strip():
+                            wrongs.append(up.filename + ": no readable text found.")
+                            continue
+                        result, ai_err = head_review_with_ai(
+                            text, head, hd["points"], instructions)
+                        del text
+                        if ai_err:
+                            wrongs.append(up.filename + ": " + ai_err)
+                            continue
+                        if result.get("wrong_head"):
+                            other = result["wrong_head"]
+                            link = ""
+                            for k2, n2, _e2 in HEADS:
+                                if n2.lower() == str(other).strip().lower():
+                                    link = url_for("head_page", cid=cid, head=k2)
+                                    break
+                            msg = ("<b>" + up.filename + "</b>: this tab is for <b>"
+                                   + head_name + "</b> review. The file appears to "
+                                   "belong to <b>" + str(other) + "</b>")
+                            msg += (" &mdash; <a href='" + link + "'>go to that tab</a>."
+                                    if link else ". Please use the relevant tab.")
+                            wrongs.append(msg)
+                            continue
+                        now = time.strftime("%d %b %Y, %H:%M")
+                        for upd in result.get("point_updates", []):
+                            try:
+                                pid = int(upd.get("id"))
+                            except Exception:
+                                continue
+                            for p in hd["points"]:
+                                if p["id"] == pid:
+                                    p["ai_update"] = {
+                                        "resolution": ("resolved" if
+                                            str(upd.get("resolution", "")).startswith("resolv")
+                                            else "still_open"),
+                                        "comment": str(upd.get("comment", ""))[:500],
+                                        "time": now}
+                                    if p["ai_update"]["resolution"] == "resolved":
+                                        resolved_n += 1
+                        next_id = max([p["id"] for p in hd["points"]], default=0) + 1
+                        for f in result.get("findings", []):
+                            hd["points"].append({
+                                "id": next_id, "title": str(f.get("title", ""))[:200],
+                                "explanation": str(f.get("explanation", ""))[:1500],
+                                "reference": str(f.get("reference", ""))[:300],
+                                "severity": f.get("severity", "Low"),
+                                "fix": str(f.get("fix", ""))[:800],
+                                "status": "pending", "flagged": False,
+                                "time": now, "source": up.filename})
+                            next_id += 1
+                            new_pts += 1
+                        hd["rounds"].append({
+                            "time": now, "files": [up.filename],
+                            "conclusion": str(result.get("conclusion", ""))[:600]})
+                        done.append(up.filename)
+                    except Exception as e:
+                        wrongs.append(up.filename + ": could not process ("
+                                      + str(e)[:120] + ")")
+                    gc.collect()
+                save_client(data)
+                if done:
+                    okmsg = ("Reviewed: " + ", ".join(done) + " — "
+                             + str(new_pts) + " new point(s)"
+                             + (", " + str(resolved_n) +
+                                " prior point(s) appear resolved (see AI re-checks below)"
+                                if resolved_n else "") + ".")
+                if wrongs:
+                    error = "<br>".join(wrongs)
+
+    return render_template_string(HEAD_PAGE, client=data, head_key=head,
+                                  head_name=head_name, head_examples=head_examples,
+                                  points=hd["points"], rounds=hd["rounds"],
+                                  error=error, okmsg=okmsg)
+
+
+@app.route("/hstatus", methods=["POST"])
+@login_required
+def hstatus():
+    j = request.get_json(silent=True) or {}
+    data = load_client(str(j.get("cid", "")))
+    if not data:
+        return {"error": "Client workspace not found (the free server may have "
+                         "restarted)."}, 404
+    head = str(j.get("head", ""))
+    pts = data.get("heads", {}).get(head, {}).get("points", [])
+    try:
+        pid = int(j.get("pid", -1))
+    except Exception:
+        return {"error": "Bad point id."}, 400
+    action = str(j.get("action", ""))
+    for p in pts:
+        if p["id"] == pid:
+            if action in ("pending", "resolved", "rejected"):
+                p["status"] = action
+            elif action == "flag":
+                p["flagged"] = True
+            elif action == "unflag":
+                p["flagged"] = False
+            else:
+                return {"error": "Unknown action."}, 400
+            save_client(data)
+            return {"ok": True}
+    return {"error": "Point not found."}, 404
 
 
 @app.route("/", methods=["GET", "POST"])
