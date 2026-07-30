@@ -821,6 +821,25 @@ def update_results(rid, batch):
 
 CLIENTS_FILE = os.path.join(RESULTS_DIR, "clients.json")
 CLIENT_FILES_DIR = os.path.join(RESULTS_DIR, "clientfiles")
+
+# ---- permanent client storage (automatic, survives restarts/deploys) ----
+# Set MONGODB_URI in Render's Environment to a free MongoDB Atlas connection
+# string and all client workspaces + stored files save there automatically.
+# Without it, the app falls back to the free server's temporary disk.
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+_mongo = None
+_gridfs = None
+if MONGODB_URI:
+    try:
+        from pymongo import MongoClient
+        import gridfs as _gridfs_mod
+        _mongo = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=8000)["audit_reviewer"]
+        _gridfs = _gridfs_mod.GridFS(_mongo)
+        _mongo["meta"].find_one({"_id": "ping"})  # fail fast if unreachable
+    except Exception:
+        _mongo = None
+        _gridfs = None
+PERMANENT_STORE = _mongo is not None
 os.makedirs(CLIENT_FILES_DIR, exist_ok=True)
 MAX_STORED_FILE = 15 * 1024 * 1024  # keep originals up to 15 MB each
 
@@ -841,6 +860,10 @@ def store_client_file(cid, filename, raw):
             return None, ""
         fid = uuid.uuid4().hex[:12]
         ext = _safe_ext(filename)
+        if PERMANENT_STORE:
+            _gridfs.put(raw, filename=fid + ext,
+                        metadata={"cid": cid, "fid": fid, "name": filename})
+            return fid, ext
         safe_cid = "".join(c for c in cid if c.isalnum())
         with open(os.path.join(CLIENT_FILES_DIR, safe_cid + "_" + fid + ext), "wb") as f:
             f.write(raw)
@@ -852,6 +875,13 @@ def store_client_file(cid, filename, raw):
 def discard_client_file(cid, fid, ext):
     if not fid:
         return
+    if PERMANENT_STORE:
+        try:
+            for gf in _gridfs.find({"metadata.cid": cid, "metadata.fid": fid}):
+                _gridfs.delete(gf._id)
+            return
+        except Exception:
+            pass
     try:
         safe_cid = "".join(c for c in cid if c.isalnum())
         os.remove(os.path.join(CLIENT_FILES_DIR, safe_cid + "_" + fid + ext))
@@ -859,7 +889,32 @@ def discard_client_file(cid, fid, ext):
         pass
 
 
+def get_client_file(cid, fid, ext):
+    """Return the stored original's bytes, or None."""
+    if PERMANENT_STORE:
+        try:
+            gf = _gridfs.find_one({"metadata.cid": cid, "metadata.fid": fid})
+            if gf:
+                return gf.read()
+            return None
+        except Exception:
+            pass
+    try:
+        safe_cid = "".join(c for c in cid if c.isalnum())
+        path = os.path.join(CLIENT_FILES_DIR, safe_cid + "_" + fid + ext)
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
 def load_clients():
+    if PERMANENT_STORE:
+        try:
+            doc = _mongo["meta"].find_one({"_id": "clients"})
+            return doc["list"] if doc else []
+        except Exception:
+            pass
     try:
         with open(CLIENTS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -868,6 +923,14 @@ def load_clients():
 
 
 def save_clients(clients):
+    if PERMANENT_STORE:
+        try:
+            _mongo["meta"].replace_one({"_id": "clients"},
+                                       {"_id": "clients", "list": clients},
+                                       upsert=True)
+            return
+        except Exception:
+            pass
     with open(CLIENTS_FILE, "w", encoding="utf-8") as f:
         json.dump(clients, f)
 
@@ -878,6 +941,15 @@ def client_path(cid):
 
 
 def load_client(cid):
+    if PERMANENT_STORE:
+        try:
+            doc = _mongo["clients"].find_one({"_id": cid})
+            if doc:
+                doc.pop("_id", None)
+                return doc
+            return None
+        except Exception:
+            pass
     try:
         with open(client_path(cid), "r", encoding="utf-8") as f:
             return json.load(f)
@@ -886,8 +958,37 @@ def load_client(cid):
 
 
 def save_client(data):
+    if PERMANENT_STORE:
+        try:
+            doc = dict(data)
+            doc["_id"] = data["cid"]
+            _mongo["clients"].replace_one({"_id": data["cid"]}, doc, upsert=True)
+            return
+        except Exception:
+            pass
     with open(client_path(data["cid"]), "w", encoding="utf-8") as f:
         json.dump(data, f)
+
+
+def delete_client_data(cid):
+    if PERMANENT_STORE:
+        try:
+            _mongo["clients"].delete_one({"_id": cid})
+            for gf in _gridfs.find({"metadata.cid": cid}):
+                _gridfs.delete(gf._id)
+        except Exception:
+            pass
+    try:
+        os.remove(client_path(cid))
+    except Exception:
+        pass
+    try:
+        safe_cid = "".join(c for c in cid if c.isalnum())
+        for fn in os.listdir(CLIENT_FILES_DIR):
+            if fn.startswith(safe_cid + "_"):
+                os.remove(os.path.join(CLIENT_FILES_DIR, fn))
+    except Exception:
+        pass
 
 
 def load_results(rid):
@@ -1187,14 +1288,17 @@ CLIENTS_PAGE = """
   {% endif %}
  </div>
 
- <div class="card">
-  <b style="font-size:13.5px;">&#128190; Restore a client from backup</b>
-  <form method="post" action="{{ url_for('client_import') }}" enctype="multipart/form-data"
-        style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-    <input type="file" name="backup" accept=".json" style="font-size:12px;">
-    <button type="submit" class="mini" style="background:#00A09B;color:#fff;border-color:#00A09B;">Import backup</button>
-  </form>
-  <div style="font-size:11px;color:#8595A5;margin-top:6px;line-height:1.5;">Download a Backup for each client after big review sessions &mdash; if the free server ever restarts, Import brings the whole workspace (points, statuses, history, file text, FS anchor) straight back. Original binary files are not inside backups; keep those in your own folders.</div>
+ <div style="text-align:right;margin-top:2px;">
+  <a href="#" onclick="document.getElementById('restorebox').style.display='block';this.style.display='none';return false;"
+     style="font-size:11px;color:#8595A5;text-decoration:none;">Restore a client from a backup file&hellip;</a>
+  <div id="restorebox" style="display:none;text-align:left;background:#fff;border:1px solid #D9DDE1;border-radius:12px;padding:14px 16px;margin-top:8px;">
+   <form method="post" action="{{ url_for('client_import') }}" enctype="multipart/form-data"
+         style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+     <input type="file" name="backup" accept=".json" style="font-size:12px;">
+     <button type="submit" class="mini" style="background:#00A09B;color:#fff;border-color:#00A09B;">Import backup</button>
+   </form>
+   <div style="font-size:11px;color:#8595A5;margin-top:6px;line-height:1.5;">Only for _backup.json files made with a client's Backup button &mdash; restores that client's whole workspace after a server restart.</div>
+  </div>
  </div>
 
  <form id="renameForm" method="post" style="display:none;"><input name="new_name" id="renameInput"></form>
@@ -1208,7 +1312,7 @@ CLIENTS_PAGE = """
    f.submit();
  }
  </script>
- <div class="note">Use sample / training data only on this free hosting. Client workspaces are kept on the free server and are cleared if it restarts or redeploys &mdash; download reports for permanent records. Permanent storage arrives with the firm's own server (Stage 5).</div>
+ <div class="note">{% if permanent %}&#9989; Permanent storage is ON &mdash; clients, review points and files save automatically to the firm database and survive server restarts and updates.{% else %}&#9888;&#65039; Automatic permanent storage is OFF &mdash; workspaces live on the free server and are cleared if it restarts or redeploys. Ask your admin to set MONGODB_URI to switch on automatic saving.{% endif %} Use sample / training data only on this free hosting. Client workspaces are kept on the free server and are cleared if it restarts or redeploys &mdash; download reports for permanent records. Permanent storage arrives with the firm's own server (Stage 5).</div>
 </div></body></html>
 """
 
@@ -1380,6 +1484,22 @@ HEAD_PAGE = """
  .pt[data-flag="1"] .stbtn.flg{background:#5B4FC0;color:#fff;border-color:#5B4FC0;}
  .pt[data-status="rejected"] .ptitle,.pt[data-status="rejected"] .pexpl{opacity:.5;text-decoration:line-through;}
  .round{font-size:12px;color:#5B7083;border-left:3px solid #D9DDE1;padding:4px 10px;margin-bottom:8px;}
+ .disc-btn{margin-top:10px;background:#EAF6F6;color:#00706C;border:1px solid #BFE0DE;
+        padding:6px 13px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;}
+ .disc-btn:hover{background:#DDF1F0;}
+ .pdisc{margin-top:10px;border:1px solid #BFE0DE;border-radius:8px;background:#F7FBFB;padding:10px;}
+ .pdlog{max-height:320px;overflow-y:auto;margin-bottom:8px;}
+ .dmsg{padding:8px 11px;border-radius:8px;margin-bottom:7px;font-size:12.5px;line-height:1.55;white-space:pre-wrap;}
+ .du{background:#E4EFF9;color:#0A3556;margin-left:12%;}
+ .da{background:#fff;border:1px solid #D9DDE1;color:#3A4A64;margin-right:12%;}
+ .dwait{color:#5B7083;font-size:12px;font-style:italic;margin-bottom:7px;}
+ .pdin{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #B7BFC6;border-radius:6px;
+      font-size:12.5px;font-family:inherit;resize:vertical;min-height:38px;margin-bottom:7px;}
+ .pdrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+ .pdfile{font-size:11px;flex:1;min-width:150px;}
+ .dsend{background:#00A09B;color:#fff;border:none;padding:8px 16px;border-radius:6px;
+        font-size:12.5px;font-weight:600;cursor:pointer;}
+ .dnote2{font-size:10.5px;color:#8595A5;margin-top:5px;}
  h2{font-size:16px;margin:0 0 12px;}
  .spin{display:none;color:#00706C;font-size:13px;margin-top:10px;font-weight:600;}
 </style></head><body>
@@ -1452,6 +1572,18 @@ HEAD_PAGE = """
       <button type="button" class="stbtn rej" onclick="hstat(this,'rejected')">&#10007; Rejected</button>
       <button type="button" class="stbtn flg" onclick="hflag(this)">&#9873; Flag</button>
     </div>
+    <button type="button" class="disc-btn" onclick="pdToggle(this)">&#128172; Discuss / add evidence</button>
+    <div class="pdisc" hidden>
+      <div class="pdlog">
+        {% for m in p.get('discussion', []) %}<div class="dmsg {{ 'du' if m['role']=='user' else 'da' }}">{{ m['content'] }}</div>{% endfor %}
+      </div>
+      <textarea class="pdin" placeholder="Ask a question, object to this point, or explain what you're attaching..."></textarea>
+      <div class="pdrow">
+        <input type="file" class="pdfile" accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt">
+        <button type="button" class="dsend" onclick="pdSend(this)">Send</button>
+      </div>
+      <div class="dnote2">Attach supporting documents any time &mdash; the AI answers knowing this point, its source file, and the FS anchor, and says whether the evidence resolves it. The discussion is saved with the client. Final judgement stays with the audit team.</div>
+    </div>
    </div>
   {% endfor %}
  </div>
@@ -1506,6 +1638,35 @@ function hpost(el, action, ok){
    .catch(()=>alert('Could not reach the server.'));
 }
 function hstat(btn,s){ const el=btn.closest('.pt'); hpost(el,s,()=>{el.dataset.status=s;}); }
+function pdToggle(btn){ const d = btn.nextElementSibling; d.hidden = !d.hidden;
+  if(!d.hidden){ const l=d.querySelector('.pdlog'); l.scrollTop=l.scrollHeight; d.querySelector('.pdin').focus(); } }
+function pdMsg(log, cls, text){ const m=document.createElement('div'); m.className='dmsg '+cls;
+  m.textContent=text; log.appendChild(m); log.scrollTop=log.scrollHeight; return m; }
+function pdSend(btn){
+  const box = btn.closest('.pdisc');
+  const el = btn.closest('.pt');
+  const log = box.querySelector('.pdlog');
+  const inp = box.querySelector('.pdin');
+  const fin = box.querySelector('.pdfile');
+  const q = inp.value.trim();
+  if(!q && !fin.files.length) return;
+  btn.disabled = true;
+  const fd = new FormData();
+  fd.append('cid', CID); fd.append('head', HEAD);
+  fd.append('pid', el.dataset.pid); fd.append('question', q);
+  if(fin.files.length) fd.append('doc', fin.files[0]);
+  const shown = q + (fin.files.length ? '  [attached: ' + fin.files[0].name + ']' : '');
+  pdMsg(log, 'du', shown || '(attachment)');
+  const wait = document.createElement('div'); wait.className='dwait';
+  wait.textContent = 'The reviewer is examining...'; log.appendChild(wait); log.scrollTop=log.scrollHeight;
+  inp.value = ''; fin.value = '';
+  fetch('/hdiscuss', {method:'POST', body: fd})
+   .then(r=>r.json()).then(d=>{
+     wait.remove();
+     pdMsg(log, 'da', d.answer || d.error || 'Something went wrong. Please try again.');
+   }).catch(()=>{ wait.remove(); pdMsg(log,'da','Could not reach the server. Please try again.'); })
+   .finally(()=>{ btn.disabled=false; });
+}
 function hflag(btn){ const el=btn.closest('.pt');
   const a=el.dataset.flag==='1'?'unflag':'flag';
   hpost(el,a,()=>{el.dataset.flag=el.dataset.flag==='1'?'0':'1';}); }
@@ -2044,7 +2205,8 @@ def clients_page():
                 save_client({"cid": cid, "name": name, "heads": {}})
                 return redirect(url_for("client_heads", cid=cid))
     return render_template_string(CLIENTS_PAGE, clients=load_clients(),
-                                  user=session.get("user"), error=error)
+                                  user=session.get("user"), error=error,
+                                  permanent=PERMANENT_STORE)
 
 
 @app.route("/clients/<cid>/rename", methods=["POST"])
@@ -2082,17 +2244,7 @@ def client_close(cid):
 def client_delete(cid):
     clients = [cl for cl in load_clients() if cl["cid"] != cid]
     save_clients(clients)
-    try:
-        os.remove(client_path(cid))
-    except Exception:
-        pass
-    try:
-        safe_cid = "".join(c for c in cid if c.isalnum())
-        for fn in os.listdir(CLIENT_FILES_DIR):
-            if fn.startswith(safe_cid + "_"):
-                os.remove(os.path.join(CLIENT_FILES_DIR, fn))
-    except Exception:
-        pass
+    delete_client_data(cid)
     return redirect(url_for("clients_page"))
 
 
@@ -2143,7 +2295,8 @@ def client_import():
             error = ("That file is not a valid client backup. Use a file downloaded "
                      "with a client's Backup button.")
     return render_template_string(CLIENTS_PAGE, clients=load_clients(),
-                                  user=session.get("user"), error=error)
+                                  user=session.get("user"), error=error,
+                                  permanent=PERMANENT_STORE)
 
 
 @app.route("/client/<cid>")
@@ -2449,11 +2602,113 @@ def open_client_file(cid, fid):
                 break
     if not entry:
         return "File not on record (it may predate file-saving, or the free server restarted).", 404
-    safe_cid = "".join(c for c in cid if c.isalnum())
-    path = os.path.join(CLIENT_FILES_DIR, safe_cid + "_" + fid + entry["ext"])
-    if not os.path.exists(path):
-        return "The stored copy is no longer available (the free server restarted).", 404
-    return send_file(path, as_attachment=True, download_name=entry["name"])
+    blob = get_client_file(cid, fid, entry["ext"])
+    if blob is None:
+        return "The stored copy is no longer available.", 404
+    return send_file(io.BytesIO(blob), as_attachment=True,
+                     download_name=entry["name"])
+
+
+@app.route("/hdiscuss", methods=["POST"])
+@login_required
+def hdiscuss():
+    if not AI_KEY_SET:
+        return {"error": "The AI API key is not set."}, 500
+    cid = str(request.form.get("cid", ""))
+    head = str(request.form.get("head", ""))
+    data = load_client(cid)
+    if not data:
+        return {"error": "Client workspace not found."}, 404
+    try:
+        pid = int(request.form.get("pid", -1))
+    except Exception:
+        return {"error": "Bad point id."}, 400
+    pts = data.get("heads", {}).get(head, {}).get("points", [])
+    point = next((p for p in pts if p["id"] == pid), None)
+    if point is None:
+        return {"error": "That review point could not be found."}, 404
+
+    question = (request.form.get("question") or "").strip()[:2000]
+    doc = request.files.get("doc")
+    doc_text, doc_name = "", ""
+    if doc and doc.filename:
+        try:
+            raw = doc.read()
+            t = extract_text_from_file(doc.filename, raw)
+            del raw
+            if t is None:
+                return {"error": "Unsupported attachment type."}, 400
+            if not t.strip():
+                return {"error": "No readable text found in the attachment "
+                                 "(a scanned PDF without a text layer, perhaps)."}, 400
+            doc_text = t[:15000]
+            doc_name = doc.filename
+        except Exception as e:
+            return {"error": "Could not read the attachment: " + str(e)[:100]}, 400
+    if not question and not doc_text:
+        return {"error": "Type a question or attach a document (or both)."}, 400
+    if not question:
+        question = "Please assess the attached document against this review point."
+
+    context = ("CLIENT: " + data.get("name", "") + "\n"
+               "AREA: " + HEAD_NAMES.get(head, head) + "\n\n"
+               "THE REVIEW POINT UNDER DISCUSSION (id " + str(pid) + ", current "
+               "status: " + point.get("status", "pending") + "):\n"
+               "Title: " + str(point.get("title", "")) + "\n"
+               "Severity: " + str(point.get("severity", "")) + "\n"
+               "Explanation: " + str(point.get("explanation", "")) + "\n"
+               "Reference: " + str(point.get("reference", "")) + "\n"
+               "Suggested fix: " + str(point.get("fix", "")) + "\n"
+               "Raised from file: " + str(point.get("source", "")))
+    src_excerpt = ""
+    for d in data.get("library", []):
+        if d.get("name") == point.get("source"):
+            src_excerpt = d.get("excerpt", "")[:6000]
+            break
+    fs_excerpt = (data.get("fs") or {}).get("excerpt", "")[:6000]
+
+    messages = [
+        {"role": "system", "content": DISCUSS_INSTRUCTIONS},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY:\n\n" + KNOWLEDGE_BASE},
+        {"role": "system", "content": context},
+    ]
+    if src_excerpt:
+        messages.append({"role": "system", "content":
+            "EXCERPT OF THE SOURCE FILE the point was raised from:\n" + src_excerpt})
+    if fs_excerpt:
+        messages.append({"role": "system", "content":
+            "EXCERPT OF THE CLIENT FINANCIAL STATEMENTS (engagement anchor) for "
+            "tie-outs and dates:\n" + fs_excerpt})
+    for m in point.get("discussion", [])[-8:]:
+        if m.get("role") in ("user", "assistant") and m.get("content"):
+            messages.append({"role": m["role"], "content": str(m["content"])[:2000]})
+    user_msg = question
+    if doc_text:
+        user_msg += ("\n\n[ATTACHED DOCUMENT \"" + doc_name + "\" — extracted "
+                     "content:]\n" + doc_text +
+                     "\n\nAssess honestly whether this attachment resolves the "
+                     "point, partly resolves it, or leaves it open — and say "
+                     "exactly what (if anything) is still missing.")
+    messages.append({"role": "user", "content": user_msg})
+
+    try:
+        response = client.chat.completions.create(
+            model=AI_MODEL, messages=messages,
+            max_tokens=1200, temperature=0.2)
+        answer = response.choices[0].message.content.strip()
+    except Exception as e:
+        err_name = type(e).__name__
+        if "Timeout" in err_name or "timeout" in str(e).lower():
+            return {"error": "The AI took too long. Please try again."}, 504
+        return {"error": "The AI could not be reached (" + err_name + ")."}, 502
+
+    disc = point.setdefault("discussion", [])
+    shown_q = question + (("  [attached: " + doc_name + "]") if doc_name else "")
+    disc.append({"role": "user", "content": shown_q})
+    disc.append({"role": "assistant", "content": answer})
+    del disc[:-20]
+    save_client(data)
+    return {"answer": answer, "shown_q": shown_q}
 
 
 @app.route("/hstatus", methods=["POST"])
