@@ -1248,6 +1248,98 @@ def build_pdf(batch):
     return buf
 
 
+
+COMMON_UI = """
+<style>
+ :root{--bt-accent:#00A09B;--bt-navy:#0c1b34;}
+ @media(min-width:1400px){
+   html{font-size:17px;}
+   .wrap,.layout,.cols{max-width:1360px !important;}
+   .stage{max-width:940px !important;}
+   .choice{padding:34px 26px !important;}
+   .choices{max-width:720px !important;gap:22px !important;}
+   .brand img{height:56px !important;}
+   h1{font-size:26px !important;}
+ }
+ @media(max-width:700px){
+   .top,.band{flex-direction:column;align-items:flex-start !important;gap:6px !important;}
+   .who{font-size:11.5px !important;}
+   .stat-row .stbtn,.dsend,.go{padding:9px 14px !important;font-size:12.5px !important;}
+   .sbar{gap:6px !important;} .sb{font-size:11px !important;padding:5px 9px !important;}
+   .grid{grid-template-columns:1fr !important;}
+   .choices{grid-template-columns:1fr !important;}
+   .drow{flex-direction:column;align-items:stretch !important;}
+   .pdrow{flex-direction:column;align-items:stretch !important;}
+   h1{font-size:17px !important;}
+ }
+ .rise{opacity:0;animation:btRise .55s cubic-bezier(.2,.7,.3,1) forwards;}
+ @keyframes btRise{from{opacity:0;transform:translateY(16px) scale(.985);}to{opacity:1;transform:translateY(0) scale(1);}}
+ .card,.hd,.cl,.choice{transition:transform .22s ease, box-shadow .22s ease, border-color .22s ease;}
+ .card:hover{box-shadow:0 6px 22px rgba(12,27,52,.07);}
+ .hd:hover,.cl:hover{transform:translateY(-3px);}
+ .go:hover,.dsend:hover{filter:brightness(1.07);}
+ .bt-dot{position:fixed;border-radius:50%;pointer-events:none;z-index:0;}
+ @keyframes btDriftA{0%,100%{transform:translate(0,0) scale(1);}50%{transform:translate(26px,-34px) scale(1.25);}}
+ @keyframes btDriftB{0%,100%{transform:translate(0,0) scale(1);}50%{transform:translate(-30px,24px) scale(.8);}}
+ @keyframes btDriftC{0%{transform:translate(0,0);opacity:.12;}50%{opacity:.4;}100%{transform:translate(14px,-60px);opacity:.12;}}
+ @keyframes btSpinCW{to{transform:rotate(360deg);}}
+ @keyframes btSpinCCW{to{transform:rotate(-360deg);}}
+ @keyframes btCorePulse{0%,100%{transform:scale(1);}50%{transform:scale(1.18);}}
+ .fontctl{position:fixed;bottom:14px;right:14px;z-index:50;display:flex;gap:6px;
+   background:rgba(12,27,52,.85);border-radius:20px;padding:6px 10px;}
+ .fontctl button{background:none;border:none;color:#9FE1CB;font-weight:700;font-size:14px;
+   cursor:pointer;padding:2px 7px;line-height:1;}
+ .fontctl button:hover{color:#fff;}
+</style>
+<script>
+document.addEventListener('DOMContentLoaded', function(){
+  var fs = localStorage.getItem('bt_fontsize');
+  if(fs){ document.documentElement.style.fontSize = fs + '%'; }
+  var ctl = document.createElement('div');
+  ctl.className = 'fontctl';
+  ctl.innerHTML = '<button type="button" title="Smaller text" aria-label="Smaller text">A\u2212</button>'
+                + '<button type="button" title="Larger text" aria-label="Larger text">A+</button>';
+  document.body.appendChild(ctl);
+  var bs = ctl.querySelectorAll('button');
+  function setFs(d){
+    var cur = parseInt(localStorage.getItem('bt_fontsize') || '100', 10);
+    cur = Math.min(140, Math.max(80, cur + d));
+    localStorage.setItem('bt_fontsize', cur);
+    document.documentElement.style.fontSize = cur + '%';
+  }
+  bs[0].onclick = function(){ setFs(-10); };
+  bs[1].onclick = function(){ setFs(10); };
+
+  if(document.body.classList.contains('darkbg')){
+    var colors = ['#2dd4bf','#5eead4','#7c6cf0','#9FE1CB'];
+    var anims = ['btDriftA','btDriftB','btDriftC'];
+    for(var i=0;i<16;i++){
+      var d = document.createElement('span');
+      d.className = 'bt-dot';
+      var s = 3 + Math.random()*7;
+      d.style.width = s+'px'; d.style.height = s+'px';
+      d.style.left = (Math.random()*97)+'vw';
+      d.style.top = (Math.random()*94)+'vh';
+      d.style.background = colors[i % colors.length];
+      d.style.opacity = (0.12 + Math.random()*0.28).toFixed(2);
+      d.style.animation = anims[i % anims.length] + ' ' + (7+Math.random()*9).toFixed(1)
+                        + 's ease-in-out ' + (Math.random()*4).toFixed(1) + 's infinite';
+      document.body.appendChild(d);
+    }
+  } else {
+    var els = document.querySelectorAll('.card,.hd,.cl,.finding,.pt,.side,.fside,.sub,.notice,.sbar');
+    var n = 0;
+    els.forEach(function(el){
+      if(n > 24) return;
+      el.classList.add('rise');
+      el.style.animationDelay = (n * 0.06).toFixed(2) + 's';
+      n++;
+    });
+  }
+});
+</script>
+"""
+
 CHOOSE_PAGE = """
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1292,9 +1384,15 @@ CHOOSE_PAGE = """
  <span class="dot d4"></span><span class="dot d5"></span>
  <div class="who">Signed in as <b>{{ user }}</b>
   <a href="{{ url_for('logout') }}">Log out</a></div>
- <div class="brand">
-  <img src="https://www.bakertilly.pk/assets/images/logo.svg" alt="Baker Tilly"
-       onerror="this.outerHTML=&quot;<div class=logofb></div>&quot;">
+ <div class="brand" style="animation:none;">
+  <svg width="52" height="52" viewBox="0 0 100 100" role="img" aria-label="Baker Tilly">
+    <g fill="none" stroke="#ffffff" stroke-width="8" stroke-linecap="round">
+      <path d="M18 66 A34 34 0 1 1 66 82" style="transform-origin:50px 50px;animation:btSpinCW 14s linear infinite;"/>
+      <path d="M34 64 A20 20 0 1 1 62 70" style="transform-origin:50px 50px;animation:btSpinCCW 9s linear infinite;"/>
+    </g>
+    <circle cx="60" cy="58" r="11" fill="#ffffff" style="transform-origin:60px 58px;animation:btCorePulse 3s ease-in-out infinite;"/>
+  </svg>
+  <span style="color:#ffffff;font-size:26px;font-weight:500;letter-spacing:.5px;">baker<span style="color:#5eead4;">tilly</span></span>
  </div>
  <h1>AI Audit Reviewer</h1>
  <div class="sub">Choose a review type to begin</div>
@@ -1336,6 +1434,15 @@ WP_CHOICE_PAGE = """
  .back{display:inline-block;margin-top:24px;color:#5eead4;font-size:13px;text-decoration:none;}
 </style></head><body>
 <div class="stage">
+ <div style="margin-bottom:10px;">
+  <svg width="40" height="40" viewBox="0 0 100 100" role="img" aria-label="Baker Tilly">
+    <g fill="none" stroke="#ffffff" stroke-width="8" stroke-linecap="round">
+      <path d="M18 66 A34 34 0 1 1 66 82" style="transform-origin:50px 50px;animation:btSpinCW 14s linear infinite;"/>
+      <path d="M34 64 A20 20 0 1 1 62 70" style="transform-origin:50px 50px;animation:btSpinCCW 9s linear infinite;"/>
+    </g>
+    <circle cx="60" cy="58" r="11" fill="#ffffff" style="transform-origin:60px 58px;animation:btCorePulse 3s ease-in-out infinite;"/>
+  </svg>
+ </div>
  <h1>Working-paper review</h1>
  <div class="sub">Choose the scope</div>
  <div class="choices">
@@ -2270,6 +2377,18 @@ function discSend(btn){
 </script>
 </body></html>
 """
+
+
+
+
+for _tpl in ("CHOOSE_PAGE", "WP_CHOICE_PAGE", "CLIENTS_PAGE", "CLIENT_HEADS_PAGE",
+             "HEAD_PAGE", "LOGIN_PAGE", "MAIN_PAGE"):
+    if _tpl in globals():
+        globals()[_tpl] = globals()[_tpl].replace("</head>", COMMON_UI + "</head>")
+# dark ambient pages get the full-screen drifting dots
+for _tpl in ("CHOOSE_PAGE", "WP_CHOICE_PAGE"):
+    if _tpl in globals():
+        globals()[_tpl] = globals()[_tpl].replace("<body>", "<body class=\"darkbg\">", 1)
 
 
 @app.route("/login", methods=["GET", "POST"])
