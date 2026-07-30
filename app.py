@@ -44,6 +44,16 @@ from reportlab.lib import colors
 app = Flask(__name__)
 UPLOAD_LIMIT_MB = 50
 app.config["MAX_CONTENT_LENGTH"] = UPLOAD_LIMIT_MB * 1024 * 1024
+@app.context_processor
+def _engine_ctx():
+    cur = current_engine()
+    other = next((k for k in ENGINES if k != cur), None)
+    return {"engine_current": ENGINES.get(cur, {}).get("label", ""),
+            "engine_other_key": other,
+            "engine_other_label": ENGINES.get(other, {}).get("label", "") if other else "",
+            "engine_multi": len(ENGINES) > 1}
+
+
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-set-SECRET-KEY-env-var")
 
 
@@ -82,24 +92,57 @@ def server_error(e):
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-# Engine switch: set AI_PROVIDER=claude (plus ANTHROPIC_API_KEY) in Render to
-# run reviews on Claude; anything else uses DeepSeek. AI_MODEL can override
-# the default model name for either provider. No code change needed to switch.
+# Dual-engine setup: both providers are available side by side when their keys
+# are set. The person switches engines in the app (stored per login session);
+# AI_PROVIDER only sets the default. Model names overridable via env:
+#   DEEPSEEK_MODEL (default deepseek-v4-flash — the old deepseek-chat alias
+#   was retired by DeepSeek on 24 Jul 2026), CLAUDE_MODEL (default sonnet).
+# timeout: never wait more than 150s per attempt (1 retry) so a hung response
+# fails with a friendly message instead of a killed worker.
+ENGINES = {}
+if DEEPSEEK_API_KEY:
+    ENGINES["deepseek"] = {
+        "client": OpenAI(api_key=DEEPSEEK_API_KEY,
+                         base_url="https://api.deepseek.com",
+                         timeout=150.0, max_retries=1),
+        "model": os.environ.get("DEEPSEEK_MODEL",
+                 os.environ.get("AI_MODEL", "deepseek-v4-flash")),
+        "label": "DeepSeek (fast & cheap)"}
+if ANTHROPIC_API_KEY:
+    ENGINES["claude"] = {
+        "client": OpenAI(api_key=ANTHROPIC_API_KEY,
+                         base_url="https://api.anthropic.com/v1/",
+                         timeout=150.0, max_retries=1),
+        "model": os.environ.get("CLAUDE_MODEL", "claude-sonnet-5"),
+        "label": "Claude (best quality)"}
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "deepseek").strip().lower()
-# timeout: never wait more than 150s for one API attempt (retry once), so a
-# slow/hung response fails with a friendly per-file message instead of
-# blocking until gunicorn kills the whole worker mid-request.
-if AI_PROVIDER == "claude" and ANTHROPIC_API_KEY:
-    client = OpenAI(api_key=ANTHROPIC_API_KEY,
-                    base_url="https://api.anthropic.com/v1/",
-                    timeout=150.0, max_retries=1)
-    AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-5")
-    AI_KEY_SET = True
-else:
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com",
-                    timeout=150.0, max_retries=1)
-    AI_MODEL = os.environ.get("AI_MODEL", "deepseek-chat")
-    AI_KEY_SET = bool(DEEPSEEK_API_KEY)
+DEFAULT_ENGINE = AI_PROVIDER if AI_PROVIDER in ENGINES else (
+    "deepseek" if "deepseek" in ENGINES else
+    ("claude" if "claude" in ENGINES else ""))
+AI_KEY_SET = bool(ENGINES)
+
+
+def current_engine():
+    e = session.get("engine") if session else None
+    return e if e in ENGINES else DEFAULT_ENGINE
+
+
+def ai_chat(messages, max_tokens=6000, temperature=0.2, cheap=False):
+    """One door to both engines. cheap=True routes tiny classification jobs
+    to DeepSeek even when Claude is selected (no point paying Claude prices
+    to answer yes/no questions)."""
+    name = current_engine()
+    if cheap and "deepseek" in ENGINES:
+        name = "deepseek"
+    eng = ENGINES[name]
+    return eng["client"].chat.completions.create(
+        model=eng["model"], messages=messages,
+        max_tokens=max_tokens, temperature=temperature)
+
+
+# kept for backward references
+AI_MODEL = ENGINES.get(DEFAULT_ENGINE, {}).get("model", "")
+client = ENGINES.get(DEFAULT_ENGINE, {}).get("client")
 
 MAX_FILES_PER_BATCH = 8
 MAX_EXTRACT_CHARS = 120000
@@ -212,20 +255,114 @@ def full_access_required(f):
 
 
 def load_knowledge_base():
+    """Load every .txt in knowledge/ twice over: as one full text (small-library
+    mode) and as scored chunks (retrieval mode for the full Stage-5 library)."""
     kb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge")
     sections = []
+    chunks = []          # [(source_filename, chunk_text)]
     if os.path.isdir(kb_dir):
         for fname in sorted(os.listdir(kb_dir)):
             if fname.endswith(".txt"):
                 try:
                     with open(os.path.join(kb_dir, fname), "r", encoding="utf-8") as f:
-                        sections.append(f.read().strip())
+                        text = f.read().strip()
+                    sections.append(text)
+                    # chunk on blank-line paragraph groups, ~1500 chars each,
+                    # so retrieval can serve just the relevant sections later
+                    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+                    buf = ""
+                    for p in paras:
+                        if buf and len(buf) + len(p) > 1500:
+                            chunks.append((fname, buf))
+                            buf = p
+                        else:
+                            buf = (buf + "\n\n" + p) if buf else p
+                    if buf:
+                        chunks.append((fname, buf))
                 except Exception:
                     pass
-    return "\n\n==========\n\n".join(sections)
+    return "\n\n==========\n\n".join(sections), chunks
 
 
-KNOWLEDGE_BASE = load_knowledge_base()
+KNOWLEDGE_BASE, KNOWLEDGE_CHUNKS = load_knowledge_base()
+
+# When the whole library fits comfortably in one request, send it all (today's
+# behaviour, zero quality change). Beyond that — the full Stage-5 library —
+# retrieval kicks in automatically and sends only the most relevant sections.
+KNOWLEDGE_SEND_ALL_LIMIT = 30000   # chars
+KNOWLEDGE_BUDGET = 18000           # chars of selected sections per request
+
+_STOPWORDS = set(("the and for are with that this from have has been must should "
+                  "shall was were will would can could may might not its all any "
+                  "each per was into over under between more than when where which "
+                  "who whom these those such only also other than then them they "
+                  "there here what your our his her out but use used using does do "
+                  "did is in on of to a an as at by or if be it we you no yes").split())
+
+
+def _kb_tokens(text):
+    import re as _r
+    return [w for w in _r.findall(r"[a-z0-9]+", text.lower())
+            if len(w) > 2 and w not in _STOPWORDS]
+
+
+def _build_kb_index():
+    """Per-chunk token counts + document frequencies for simple tf-idf scoring."""
+    import math
+    from collections import Counter
+    counts = []
+    df = Counter()
+    for _src, chunk in KNOWLEDGE_CHUNKS:
+        c = Counter(_kb_tokens(chunk))
+        counts.append(c)
+        for t in c:
+            df[t] += 1
+    n = max(len(counts), 1)
+    idf = {t: math.log(1 + n / (1 + d)) for t, d in df.items()}
+    return counts, idf
+
+
+_KB_COUNTS, _KB_IDF = _build_kb_index()
+
+
+def select_knowledge(query_text, budget=KNOWLEDGE_BUDGET):
+    """Return the library text to send with a request: everything while the
+    library is small; the most relevant sections once it is large."""
+    if len(KNOWLEDGE_BASE) <= KNOWLEDGE_SEND_ALL_LIMIT or not KNOWLEDGE_CHUNKS:
+        return KNOWLEDGE_BASE
+    from collections import Counter
+    q = Counter(_kb_tokens(str(query_text)[:40000]))
+    scored = []
+    for i, c in enumerate(_KB_COUNTS):
+        s = 0.0
+        for t, qn in q.items():
+            if t in c:
+                s += min(qn, 5) * min(c[t], 5) * _KB_IDF.get(t, 0.0)
+        if s > 0:
+            scored.append((s, i))
+    scored.sort(reverse=True)
+    picked = []
+    used = 0
+    SEP = 14  # separator between selected sections
+    for s, i in scored:
+        srcname, chunk = KNOWLEDGE_CHUNKS[i]
+        piece = "[" + srcname + "]\n" + chunk
+        if used + len(piece) + SEP > budget:
+            continue
+        picked.append(piece)
+        used += len(piece) + SEP
+        if used >= budget * 0.95:
+            break
+    if not picked:
+        # nothing matched: fall back to the first sections up to budget
+        for srcname, chunk in KNOWLEDGE_CHUNKS:
+            piece = "[" + srcname + "]\n" + chunk
+            if used + len(piece) + 14 > budget:
+                break
+            picked.append(piece)
+            used += len(piece) + 14
+    return ("RELEVANT SECTIONS SELECTED FROM THE FIRM'S FULL STANDARDS LIBRARY "
+            "(sources in brackets):\n\n" + "\n\n----------\n\n".join(picked))
 
 
 def _extract_xlsx_lightweight(file_bytes, include_hidden=True):
@@ -510,7 +647,8 @@ def review_with_ai(document_text, mode="wp", user_instructions="",
     doc_label = ("financial statements" if mode == "fs" else "working paper")
     messages = [
         {"role": "system", "content": instructions},
-        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY (check against these texts):\n\n" + KNOWLEDGE_BASE},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY (check against these texts):\n\n"
+            + select_knowledge(trimmed[:30000])},
     ]
     if anchor_text:
         messages.append({"role": "system", "content":
@@ -540,12 +678,7 @@ def review_with_ai(document_text, mode="wp", user_instructions="",
     messages.append({"role": "user", "content":
         "Here is the " + doc_label + " to review:\n\n" + trimmed})
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages,
-            max_tokens=6000,
-            temperature=0.2,
-        )
+        response = ai_chat(messages, max_tokens=6000, temperature=0.2)
     except Exception as e:
         err_name = type(e).__name__
         if "Timeout" in err_name or "timeout" in str(e).lower():
@@ -569,7 +702,8 @@ def head_review_with_ai(document_text, head_key, prior_points,
     trimmed = document_text[:MAX_EXTRACT_CHARS]
     messages = [
         {"role": "system", "content": REVIEWER_INSTRUCTIONS},
-        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY (check against these texts):\n\n" + KNOWLEDGE_BASE},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY (check against these texts):\n\n"
+            + select_knowledge(head_name + " " + examples + " " + trimmed[:30000])},
         {"role": "system", "content":
             "HEAD CONTEXT: this review belongs to the head \"" + head_name + "\" "
             "(covers: " + examples + ").\n\n"
@@ -639,9 +773,7 @@ def head_review_with_ai(document_text, head_key, prior_points,
     messages.append({"role": "user", "content":
         "Here is the working paper to review:\n\n" + trimmed})
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL, messages=messages,
-            max_tokens=6000, temperature=0.2)
+        response = ai_chat(messages, max_tokens=6000, temperature=0.2)
     except Exception as e:
         err_name = type(e).__name__
         if "Timeout" in err_name or "timeout" in str(e).lower():
@@ -686,9 +818,8 @@ def batch_conclusion_with_ai(batch):
     material = "\n".join(parts)[:30000]
 
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL,
-            messages=[
+        response = ai_chat(
+            [
                 {"role": "system", "content": BATCH_INSTRUCTIONS},
                 {"role": "user", "content": material},
             ],
@@ -1343,6 +1474,7 @@ CLIENT_HEADS_PAGE = """
 <div class="wrap">
  {% if error %}<div style="background:#FBE9E7;border:1px solid #E5B5AC;color:#8C2F22;border-radius:8px;padding:11px 13px;font-size:13px;margin-bottom:14px;">{{ error }}</div>{% endif %}
  {% if okmsg %}<div style="background:#E2F2E9;border:1px solid #B5D8C4;color:#1F6B4F;border-radius:8px;padding:11px 13px;font-size:13px;margin-bottom:14px;">{{ okmsg }}</div>{% endif %}
+ {% if engine_multi %}<div style="font-size:12px;color:#5B7083;margin-bottom:12px;"><b>AI engine: {{ engine_current }}</b> &mdash; <a style="color:#00A09B;" href="{{ url_for('set_engine', name=engine_other_key) }}">switch to {{ engine_other_label }}</a>. Tip: DeepSeek for first passes and questions; Claude for final reviews, FS review and cross-checks.</div>{% endif %}
 
  <div style="background:#fff;border:2px solid {{ '#1F6B4F' if client.get('fs') else '#E8B84B' }};border-radius:12px;padding:16px 18px;margin-bottom:18px;">
   <b style="font-size:14px;">&#128209; Financial statements — engagement anchor</b>
@@ -1522,6 +1654,7 @@ HEAD_PAGE = """
 <div class="mainc">
  {% if error %}<div class="err">{{ error|safe }}</div>{% endif %}
  {% if okmsg %}<div class="okmsg">{{ okmsg }}</div>{% endif %}
+ {% if engine_multi %}<div style="font-size:12px;color:#5B7083;margin-bottom:10px;"><b>AI engine: {{ engine_current }}</b> &mdash; <a style="color:#00A09B;" href="{{ url_for('set_engine', name=engine_other_key) }}">switch to {{ engine_other_label }}</a></div>{% endif %}
 
  {% if not is_cross %}
  <div class="card">
@@ -1834,7 +1967,7 @@ MAIN_PAGE = """
 <div class="layout">
  <div class="maincol">
  <div class="sub">Baker Tilly - {{ 'Financial Statements review' if mode=='fs' else 'Working-paper review' }} - Stage 4
-   &nbsp;|&nbsp; <a href="{{ url_for('choose') }}">Change review type</a></div>
+   &nbsp;|&nbsp; <a href="{{ url_for('choose') }}">Change review type</a>{% if engine_multi %} &nbsp;|&nbsp; <b>AI: {{ engine_current }}</b> &mdash; <a href="{{ url_for('set_engine', name=engine_other_key) }}">switch to {{ engine_other_label }}</a>{% endif %}</div>
 
  <div class="notice"><b>Note:</b> Reviews are checked against the firm's loaded standards library. Use sample / public data until the tool moves to the firm's own server. Up to {{ maxfiles }} files per batch (each file takes 1-3 minutes; for fastest results review 3-4 at a time).</div>
 
@@ -2153,6 +2286,14 @@ def login():
             return redirect(url_for("choose"))
         error = "Incorrect username or password."
     return render_template_string(LOGIN_PAGE, error=error)
+
+
+@app.route("/engine/<name>")
+@login_required
+def set_engine(name):
+    if name in ENGINES:
+        session["engine"] = name
+    return redirect(request.referrer or url_for("home"))
 
 
 @app.route("/logout")
@@ -2669,7 +2810,8 @@ def hdiscuss():
 
     messages = [
         {"role": "system", "content": DISCUSS_INSTRUCTIONS},
-        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY:\n\n" + KNOWLEDGE_BASE},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY:\n\n"
+            + select_knowledge(context + " " + question + " " + doc_text[:8000])},
         {"role": "system", "content": context},
     ]
     if src_excerpt:
@@ -2692,9 +2834,7 @@ def hdiscuss():
     messages.append({"role": "user", "content": user_msg})
 
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL, messages=messages,
-            max_tokens=1200, temperature=0.2)
+        response = ai_chat(messages, max_tokens=1200, temperature=0.2)
         answer = response.choices[0].message.content.strip()
     except Exception as e:
         err_name = type(e).__name__
@@ -2909,9 +3049,7 @@ def fs_gate_with_ai(text):
         {"role": "user", "content": "Document extract:\n\n" + sample},
     ]
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL, messages=messages,
-            max_tokens=200, temperature=0)
+        response = ai_chat(messages, max_tokens=200, temperature=0, cheap=True)
         result, perr = parse_ai_json(response.choices[0].message.content.strip())
         if perr or not isinstance(result, dict) or "is_fs" not in result:
             return None, "", "The check could not be completed. Please try again."
@@ -2962,16 +3100,15 @@ def client_cross_check_with_ai(data):
             "Return JSON: {\"findings\": [{\"title\", \"explanation\", "
             "\"reference\", \"severity\": \"High|Medium|Low|Factual\", "
             "\"fix\"}], \"summary\", \"conclusion\"}. Return ONLY the JSON."},
-        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY:\n\n" + KNOWLEDGE_BASE},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY:\n\n"
+            + select_knowledge(" ".join(p[:4000] for p in parts))},
         {"role": "user", "content":
             "DOCUMENTS ON RECORD:\n\n" + "\n\n".join(parts)
             + ("\n\nOPEN REVIEW POINTS ACROSS HEADS (context, do not repeat):\n"
                + "\n".join(open_pts[:40]) if open_pts else "")},
     ]
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL, messages=messages,
-            max_tokens=5000, temperature=0.2)
+        response = ai_chat(messages, max_tokens=5000, temperature=0.2)
     except Exception as e:
         err_name = type(e).__name__
         if "Timeout" in err_name or "timeout" in str(e).lower():
@@ -3029,7 +3166,8 @@ def discuss():
 
     messages = [
         {"role": "system", "content": DISCUSS_INSTRUCTIONS},
-        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY:\n\n" + KNOWLEDGE_BASE},
+        {"role": "system", "content": "FIRM'S STANDARDS LIBRARY:\n\n"
+            + select_knowledge(context + " " + question)},
         {"role": "system", "content": context},
     ]
     # replay up to the last 8 turns of this discussion so the AI has the thread
@@ -3042,12 +3180,7 @@ def discuss():
     messages.append({"role": "user", "content": question})
 
     try:
-        response = client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages,
-            max_tokens=1200,
-            temperature=0.2,
-        )
+        response = ai_chat(messages, max_tokens=1200, temperature=0.2)
         answer = response.choices[0].message.content.strip()
     except Exception as e:
         err_name = type(e).__name__
