@@ -228,7 +228,7 @@ def load_knowledge_base():
 KNOWLEDGE_BASE = load_knowledge_base()
 
 
-def _extract_xlsx_lightweight(file_bytes):
+def _extract_xlsx_lightweight(file_bytes, include_hidden=True):
     """Read sheet text straight from the xlsx internals (an xlsx is a zip of
     XML files). This avoids openpyxl building the full workbook object —
     external links, styles and structures are skipped entirely, keeping
@@ -261,8 +261,26 @@ def _extract_xlsx_lightweight(file_bytes):
                             shared.append("")  # beyond cap: placeholder
                         el.clear()  # clear only completed string items
 
-        # sheet name map (falls back to file order if unavailable)
-        sheet_titles = {}
+        # sheet registry: names, order, hidden state, and file targets
+        # (workbook.xml is authoritative; rels map sheet ids to xml files)
+        REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+        rels = {}
+        try:
+            if "xl/_rels/workbook.xml.rels" in names:
+                with z.open("xl/_rels/workbook.xml.rels") as f:
+                    for ev, el in iterparse(f, events=("end",)):
+                        if el.tag.endswith("Relationship"):
+                            tgt = el.get("Target", "")
+                            if tgt.startswith("/"):
+                                tgt = tgt.lstrip("/")
+                            elif not tgt.startswith("xl/"):
+                                tgt = "xl/" + tgt
+                            rels[el.get("Id", "")] = tgt
+                        el.clear()
+        except Exception:
+            rels = {}
+
+        sheets = []  # (title, path, hidden)
         try:
             if "xl/workbook.xml" in names:
                 with z.open("xl/workbook.xml") as f:
@@ -270,22 +288,31 @@ def _extract_xlsx_lightweight(file_bytes):
                     for ev, el in iterparse(f, events=("end",)):
                         if el.tag == NS + "sheet":
                             idx += 1
-                            sheet_titles[idx] = el.get("name", f"Sheet{idx}")
+                            title = el.get("name", f"Sheet{idx}")
+                            hidden = el.get("state", "visible") in ("hidden", "veryHidden")
+                            path = rels.get(el.get(REL_NS + "id", ""), "")
+                            sheets.append((title, path, hidden))
                         el.clear()
         except Exception:
-            pass
+            sheets = []
+        if not sheets or not any(p in names for _t, p, _h in sheets):
+            sheets = [(f"Sheet{i}", n, False) for i, n in enumerate(sorted(
+                n for n in names
+                if _re.match(r"xl/worksheets/sheet\d+\.xml$", n)), start=1)]
 
-        sheet_files = sorted(
-            n for n in names
-            if _re.match(r"xl/worksheets/sheet\d+\.xml$", n)
-        )
-        for snum, sname in enumerate(sheet_files, start=1):
+        skipped_hidden = []
+        for title, sname, hidden in sheets:
+            if hidden and not include_hidden:
+                skipped_hidden.append(title)
+                continue
+            if sname not in names:
+                continue
             if total >= MAX_EXTRACT_CHARS:
                 text_parts.append("\n[... file is large; remaining sheets not "
                                   "included in this review pass ...]")
                 break
-            title = sheet_titles.get(snum, f"Sheet{snum}")
-            header = "\n===== SHEET: " + title + " ====="
+            header = ("\n===== SHEET: " + title
+                      + (" (hidden)" if hidden else "") + " =====")
             text_parts.append(header)
             total += len(header)
 
@@ -323,14 +350,18 @@ def _extract_xlsx_lightweight(file_bytes):
                         if total >= MAX_EXTRACT_CHARS:
                             break
 
+        if skipped_hidden:
+            text_parts.append("\n[Hidden sheets skipped by user setting: "
+                              + ", ".join(skipped_hidden[:20]) + "]")
+
     return "\n".join(text_parts)
 
 
-def extract_text_from_file(filename, file_bytes):
+def extract_text_from_file(filename, file_bytes, include_hidden=True):
     name = filename.lower()
 
     if name.endswith((".xlsx", ".xlsm")):
-        return _extract_xlsx_lightweight(file_bytes)
+        return _extract_xlsx_lightweight(file_bytes, include_hidden=include_hidden)
 
     elif name.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(file_bytes))
@@ -789,6 +820,43 @@ def update_results(rid, batch):
 
 
 CLIENTS_FILE = os.path.join(RESULTS_DIR, "clients.json")
+CLIENT_FILES_DIR = os.path.join(RESULTS_DIR, "clientfiles")
+os.makedirs(CLIENT_FILES_DIR, exist_ok=True)
+MAX_STORED_FILE = 15 * 1024 * 1024  # keep originals up to 15 MB each
+
+
+def _safe_ext(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    return ext if _re_ext.match(ext or "") else ""
+
+
+import re as _re_mod
+_re_ext = _re_mod.compile(r"^\.[a-z0-9]{1,6}$")
+
+
+def store_client_file(cid, filename, raw):
+    """Keep the original upload so it can be opened later. Returns (fid, ext)."""
+    try:
+        if not raw or len(raw) > MAX_STORED_FILE:
+            return None, ""
+        fid = uuid.uuid4().hex[:12]
+        ext = _safe_ext(filename)
+        safe_cid = "".join(c for c in cid if c.isalnum())
+        with open(os.path.join(CLIENT_FILES_DIR, safe_cid + "_" + fid + ext), "wb") as f:
+            f.write(raw)
+        return fid, ext
+    except Exception:
+        return None, ""
+
+
+def discard_client_file(cid, fid, ext):
+    if not fid:
+        return
+    try:
+        safe_cid = "".join(c for c in cid if c.isalnum())
+        os.remove(os.path.join(CLIENT_FILES_DIR, safe_cid + "_" + fid + ext))
+    except Exception:
+        pass
 
 
 def load_clients():
@@ -1074,6 +1142,9 @@ CLIENTS_PAGE = """
      padding:14px 16px;margin-bottom:10px;font-weight:600;}
  .cl:hover{border-color:#00A09B;background:#F4FAFA;}
  .cl small{display:block;color:#5B7083;font-weight:400;font-size:11.5px;margin-top:3px;}
+ .mini{display:inline-block;border:1px solid #D9DDE1;background:#fff;color:#3A4A64;font-size:11.5px;
+       font-weight:600;padding:5px 12px;border-radius:8px;cursor:pointer;text-decoration:none;}
+ .mini:hover{border-color:#00A09B;}
  .note{font-size:11px;color:#8595A5;line-height:1.5;}
  .err{background:#FBE9E7;border:1px solid #E5B5AC;color:#8C2F22;border-radius:8px;
       padding:10px 12px;font-size:13px;margin-bottom:12px;}
@@ -1093,13 +1164,50 @@ CLIENTS_PAGE = """
  <div class="card">
   {% if clients %}
     {% for c in clients %}
-      <a class="cl" href="{{ url_for('client_heads', cid=c['cid']) }}">&#128193; {{ c['name'] }}
-        <small>Created {{ c['created'] }}</small></a>
+      <div class="cl" style="{{ 'opacity:.55;background:#F4F5F6;' if c.get('status')=='closed' else '' }}">
+        <a href="{{ url_for('client_heads', cid=c['cid']) }}" style="text-decoration:none;color:#002B49;">
+          &#128193; {{ c['name'] }}
+          {% if c.get('status')=='closed' %}<span style="background:#EFF2F4;color:#5B7083;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;margin-left:6px;vertical-align:middle;">CLOSED</span>{% endif %}
+          <small>Created {{ c['created'] }}</small>
+        </a>
+        <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">
+          <a href="{{ url_for('client_heads', cid=c['cid']) }}" class="mini">Open</a>
+          <button type="button" class="mini" onclick="renameClient('{{ c['cid'] }}', {{ c['name'] | tojson }})">Rename</button>
+          <form method="post" action="{{ url_for('client_close', cid=c['cid']) }}" style="display:inline;">
+            <button type="submit" class="mini">{{ 'Reopen' if c.get('status')=='closed' else 'Close' }}</button></form>
+          <a href="{{ url_for('client_export', cid=c['cid']) }}" class="mini">Backup</a>
+          <form method="post" action="{{ url_for('client_delete', cid=c['cid']) }}" style="display:inline;"
+                onsubmit="return confirm('Delete {{ c['name'] }} permanently, including all its review points, files and history? This cannot be undone.');">
+            <button type="submit" class="mini" style="color:#B23A2E;border-color:#E5B5AC;">Delete</button></form>
+        </div>
+      </div>
     {% endfor %}
   {% else %}
     <div style="color:#5B7083;font-size:13.5px;">No clients yet &mdash; add your first one above.</div>
   {% endif %}
  </div>
+
+ <div class="card">
+  <b style="font-size:13.5px;">&#128190; Restore a client from backup</b>
+  <form method="post" action="{{ url_for('client_import') }}" enctype="multipart/form-data"
+        style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <input type="file" name="backup" accept=".json" style="font-size:12px;">
+    <button type="submit" class="mini" style="background:#00A09B;color:#fff;border-color:#00A09B;">Import backup</button>
+  </form>
+  <div style="font-size:11px;color:#8595A5;margin-top:6px;line-height:1.5;">Download a Backup for each client after big review sessions &mdash; if the free server ever restarts, Import brings the whole workspace (points, statuses, history, file text, FS anchor) straight back. Original binary files are not inside backups; keep those in your own folders.</div>
+ </div>
+
+ <form id="renameForm" method="post" style="display:none;"><input name="new_name" id="renameInput"></form>
+ <script>
+ function renameClient(cid, current){
+   const n = prompt('New client name:', current);
+   if(!n || !n.trim()) return;
+   const f = document.getElementById('renameForm');
+   document.getElementById('renameInput').value = n.trim();
+   f.action = '/clients/' + cid + '/rename';
+   f.submit();
+ }
+ </script>
  <div class="note">Use sample / training data only on this free hosting. Client workspaces are kept on the free server and are cleared if it restarts or redeploys &mdash; download reports for permanent records. Permanent storage arrives with the firm's own server (Stage 5).</div>
 </div></body></html>
 """
@@ -1211,7 +1319,7 @@ CLIENT_HEADS_PAGE = """
   {% if client.get('library') %}
    <div style="margin-top:10px;font-size:12px;color:#3A4A64;line-height:1.8;">
     {% for d in client['library'] | reverse %}
-      &#128196; {{ d['name'] }} <span style="color:#8595A5;">({{ head_names.get(d['head'], d['head']) }}, {{ d.get('time','') }})</span><br>
+      &#128196; {{ d['name'] }} <span style="color:#8595A5;">({{ head_names.get(d['head'], d['head']) }}, {{ d.get('time','') }})</span>{% if d.get('fid') %} &nbsp;<a href="{{ url_for('open_client_file', cid=client['cid'], fid=d['fid']) }}" style="color:#00706C;font-weight:700;text-decoration:none;">Open</a>{% endif %}<br>
     {% endfor %}
    </div>
    <div style="font-size:11px;color:#8595A5;margin-top:6px;">Every reviewed file is remembered here and automatically feeds related heads &mdash; no need to upload the same file in multiple tabs. Cleared if the free server restarts.</div>
@@ -1275,11 +1383,23 @@ HEAD_PAGE = """
  h2{font-size:16px;margin:0 0 12px;}
  .spin{display:none;color:#00706C;font-size:13px;margin-top:10px;font-weight:600;}
 </style></head><body>
+<style>
+ .cols{max-width:1160px;margin:0 auto;padding:0 24px 40px;display:flex;gap:18px;align-items:flex-start;}
+ .mainc{flex:1;min-width:0;}
+ .fside{width:230px;flex-shrink:0;background:#fff;border:1px solid #D9DDE1;border-radius:12px;
+        padding:13px;position:sticky;top:14px;max-height:calc(100vh - 28px);overflow-y:auto;}
+ @media(max-width:900px){.cols{flex-direction:column;}.fside{width:auto;position:static;max-height:none;}}
+ .fside b{font-size:12.5px;} .fitem{font-size:11.5px;margin:8px 0;line-height:1.5;word-break:break-word;}
+ .fitem a{color:#00706C;font-weight:700;text-decoration:none;}
+ .fitem small{color:#8595A5;display:block;}
+ .fnote{font-size:10px;color:#8595A5;margin-top:8px;line-height:1.5;}
+</style>
 <div class="band"><h1>{{ client['name'] }} &rsaquo; {{ head_name }}</h1>
  <div><a href="{{ url_for('client_heads', cid=client['cid']) }}">&larr; Back to heads</a>
   <a href="{{ url_for('clients_page') }}">All clients</a>
   <a href="{{ url_for('logout') }}">Log out</a></div></div>
-<div class="wrap">
+<div class="cols">
+<div class="mainc">
  {% if error %}<div class="err">{{ error|safe }}</div>{% endif %}
  {% if okmsg %}<div class="okmsg">{{ okmsg }}</div>{% endif %}
 
@@ -1290,6 +1410,8 @@ HEAD_PAGE = """
    <input type="file" name="files" multiple accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt">
    <textarea class="instr" name="instructions" maxlength="2000"
      placeholder="Optional instructions, e.g. This file answers point 3 - the missing conclusion has been added, please re-check"></textarea>
+   <label style="display:block;margin-top:9px;font-size:12.5px;color:#3A4A64;cursor:pointer;">
+     <input type="checkbox" name="hidden" checked> Review hidden Excel sheets (untick to skip them)</label>
    <button class="go" type="submit">Review in this head</button>
    <div class="spin" id="spin">Reviewing... this can take 1-3 minutes per file. Please keep the page open.</div>
   </form>
@@ -1344,6 +1466,25 @@ HEAD_PAGE = """
   {% endfor %}
  </div>
  {% endif %}
+</div>
+
+<aside class="fside">
+ <b>&#128194; Client files &mdash; open any time</b>
+ {% if client.get('fs') %}
+  <div class="fitem">&#128209; {{ client['fs']['name'] }}
+    <small>FS anchor &middot; {{ client['fs'].get('time','') }}</small>
+    {% if client['fs'].get('fid') %}<a href="{{ url_for('open_client_file', cid=client['cid'], fid=client['fs']['fid']) }}">Open</a>{% endif %}</div>
+ {% endif %}
+ {% for d in client.get('library', []) | reverse %}
+  <div class="fitem">&#128196; {{ d['name'] }}
+    <small>{{ head_names.get(d['head'], d['head']) if head_names else d['head'] }} &middot; {{ d.get('time','') }}</small>
+    {% if d.get('fid') %}<a href="{{ url_for('open_client_file', cid=client['cid'], fid=d['fid']) }}">Open</a>{% else %}<small>(text on record; original not stored)</small>{% endif %}</div>
+ {% endfor %}
+ {% if not client.get('library') and not client.get('fs') %}
+  <div class="fitem" style="color:#5B7083;">No files on record yet.</div>
+ {% endif %}
+ <div class="fnote">Originals up to 15 MB are saved with the client and open from here at any time. Cleared if the free server restarts &mdash; permanent storage arrives at Stage 5.</div>
+</aside>
 </div>
 <script>
 const CID = {{ client['cid'] | tojson }};
@@ -1554,6 +1695,8 @@ MAIN_PAGE = """
      <option value="">No anchor — review each file on its own</option>
    </select>
    <div class="instr-hint">If you upload the signed financial statements together with working papers, choose the FS here — every other file is then reviewed AGAINST it: tie-outs, contradictions, impossible dates, omissions.</div>
+   <label style="display:block;margin-top:10px;font-size:12.5px;color:#3A4A64;cursor:pointer;text-align:left;">
+     <input type="checkbox" name="hidden" checked> Review hidden Excel sheets (untick to skip them)</label>
    <div style="text-align:center;">
      <button class="go" type="submit">Review selected files</button>
      <div class="wait">Reviews take 1-3 minutes per file. Please leave the page open and wait.</div>
@@ -1904,6 +2047,105 @@ def clients_page():
                                   user=session.get("user"), error=error)
 
 
+@app.route("/clients/<cid>/rename", methods=["POST"])
+@login_required
+def client_rename(cid):
+    new = (request.form.get("new_name") or "").strip()[:80]
+    clients = load_clients()
+    if new:
+        for cl in clients:
+            if cl["cid"] == cid:
+                cl["name"] = new
+                save_clients(clients)
+                data = load_client(cid)
+                if data:
+                    data["name"] = new
+                    save_client(data)
+                break
+    return redirect(url_for("clients_page"))
+
+
+@app.route("/clients/<cid>/close", methods=["POST"])
+@login_required
+def client_close(cid):
+    clients = load_clients()
+    for cl in clients:
+        if cl["cid"] == cid:
+            cl["status"] = "active" if cl.get("status") == "closed" else "closed"
+            save_clients(clients)
+            break
+    return redirect(url_for("clients_page"))
+
+
+@app.route("/clients/<cid>/delete", methods=["POST"])
+@login_required
+def client_delete(cid):
+    clients = [cl for cl in load_clients() if cl["cid"] != cid]
+    save_clients(clients)
+    try:
+        os.remove(client_path(cid))
+    except Exception:
+        pass
+    try:
+        safe_cid = "".join(c for c in cid if c.isalnum())
+        for fn in os.listdir(CLIENT_FILES_DIR):
+            if fn.startswith(safe_cid + "_"):
+                os.remove(os.path.join(CLIENT_FILES_DIR, fn))
+    except Exception:
+        pass
+    return redirect(url_for("clients_page"))
+
+
+@app.route("/clients/<cid>/export")
+@login_required
+def client_export(cid):
+    data = load_client(cid)
+    if not data:
+        return redirect(url_for("clients_page"))
+    meta = next((cl for cl in load_clients() if cl["cid"] == cid), {})
+    payload = {"kind": "bt-audit-client-backup", "version": 1,
+               "meta": meta, "client": data,
+               "note": ("Review points, statuses, rounds, extracted file text and "
+                        "the FS anchor text are included. Original binary files "
+                        "are not - keep those separately.")}
+    buf = io.BytesIO(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    safe = "".join(ch if ch.isalnum() or ch in " -_" else "_" for ch in data.get("name", "client"))
+    return send_file(buf, as_attachment=True, mimetype="application/json",
+                     download_name=safe.strip().replace(" ", "_") + "_backup.json")
+
+
+@app.route("/clients/import", methods=["POST"])
+@login_required
+def client_import():
+    up = request.files.get("backup")
+    error = None
+    if not up or not up.filename:
+        error = "Please choose a backup file."
+    else:
+        try:
+            payload = json.loads(up.read().decode("utf-8"))
+            assert payload.get("kind") == "bt-audit-client-backup"
+            data = payload["client"]
+            assert isinstance(data.get("name"), str) and isinstance(data.get("heads", {}), dict)
+            clients = load_clients()
+            cid = data.get("cid", "")
+            if not cid or any(cl["cid"] == cid for cl in clients):
+                cid = uuid.uuid4().hex[:10]
+            data["cid"] = cid
+            meta = payload.get("meta") or {}
+            clients.insert(0, {"cid": cid, "name": data["name"],
+                               "created": meta.get("created", time.strftime("%d %b %Y")),
+                               "status": meta.get("status", "active")})
+            save_clients(clients)
+            save_client(data)
+            return redirect(url_for("client_heads", cid=cid))
+        except Exception:
+            error = ("That file is not a valid client backup. Use a file downloaded "
+                     "with a client's Backup button.")
+    return render_template_string(CLIENTS_PAGE, clients=load_clients(),
+                                  user=session.get("user"), error=error)
+
+
 @app.route("/client/<cid>")
 @login_required
 def client_heads(cid):
@@ -1947,17 +2189,22 @@ def head_page(cid, head):
             else:
                 uploads = uploads[:MAX_FILES_PER_BATCH]
                 instructions = request.form.get("instructions", "")
+                include_hidden = request.form.get("hidden") == "on"
                 wrongs, done, new_pts, resolved_n = [], [], 0, 0
                 import gc
                 for up in uploads:
                     try:
                         raw = up.read()
-                        text = extract_text_from_file(up.filename, raw)
+                        stored_fid, stored_ext = store_client_file(cid, up.filename, raw)
+                        text = extract_text_from_file(up.filename, raw,
+                                include_hidden=include_hidden)
                         del raw
                         if text is None:
+                            discard_client_file(cid, stored_fid, stored_ext)
                             wrongs.append(up.filename + ": unsupported file type.")
                             continue
                         if not text.strip():
+                            discard_client_file(cid, stored_fid, stored_ext)
                             wrongs.append(up.filename + ": no readable text found.")
                             continue
                         related = []
@@ -1979,6 +2226,7 @@ def head_page(cid, head):
                         keep_excerpt = text[:12000]
                         del text
                         if ai_err:
+                            discard_client_file(cid, stored_fid, stored_ext)
                             wrongs.append(up.filename + ": " + ai_err)
                             continue
                         if result.get("wrong_head"):
@@ -1993,6 +2241,7 @@ def head_page(cid, head):
                                    "belong to <b>" + str(other) + "</b>")
                             msg += (" &mdash; <a href='" + link + "'>go to that tab</a>."
                                     if link else ". Please use the relevant tab.")
+                            discard_client_file(cid, stored_fid, stored_ext)
                             wrongs.append(msg)
                             continue
                         now = time.strftime("%d %b %Y, %H:%M")
@@ -2030,7 +2279,8 @@ def head_page(cid, head):
                         lib[:] = [d for d in lib
                                   if not (d["name"] == up.filename and d["head"] == head)]
                         lib.append({"name": up.filename, "head": head,
-                                    "excerpt": keep_excerpt, "time": now})
+                                    "excerpt": keep_excerpt, "time": now,
+                                    "fid": stored_fid, "ext": stored_ext})
                         del lib[:-24]
                         done.append(up.filename)
                     except Exception as e:
@@ -2050,7 +2300,8 @@ def head_page(cid, head):
     return render_template_string(HEAD_PAGE, client=data, head_key=head,
                                   head_name=head_name, head_examples=head_examples,
                                   points=hd["points"], rounds=hd["rounds"],
-                                  error=error, okmsg=okmsg, is_cross=is_cross)
+                                  error=error, okmsg=okmsg, is_cross=is_cross,
+                                  head_names=HEAD_NAMES)
 
 
 @app.route("/client/<cid>/fs", methods=["POST"])
@@ -2075,14 +2326,29 @@ def client_fs(cid):
                 error = ("No readable text found in that file (a scanned PDF "
                          "without a text layer, perhaps).")
             else:
-                data["fs"] = {"name": up.filename,
-                              "excerpt": text[:ANCHOR_CHARS],
-                              "time": time.strftime("%d %b %Y, %H:%M")}
+                is_fs, looks_like, gerr = fs_gate_with_ai(text)
+                if gerr:
+                    error = gerr
+                elif not is_fs:
+                    error = ("This upload must be the client's FINANCIAL "
+                             "STATEMENTS (statement of financial position, "
+                             "profit or loss, cash flows, equity, notes). "
+                             "\"" + up.filename + "\" appears to be: "
+                             + (looks_like or "a different kind of document")
+                             + ". Working papers belong in their head tabs - "
+                             "please upload the financial statements here.")
+                else:
+                    up.seek(0)
+                    fs_fid, fs_ext = store_client_file(cid, up.filename, up.read())
+                    data["fs"] = {"name": up.filename,
+                                  "excerpt": text[:ANCHOR_CHARS],
+                                  "time": time.strftime("%d %b %Y, %H:%M"),
+                                  "fid": fs_fid, "ext": fs_ext}
+                    save_client(data)
+                    okmsg = ("Financial statements saved as the engagement anchor. "
+                             "Every working paper reviewed in any head will now also "
+                             "be checked against them automatically.")
                 del text
-                save_client(data)
-                okmsg = ("Financial statements saved as the engagement anchor. "
-                         "Every working paper reviewed in any head will now also "
-                         "be checked against them automatically.")
         except Exception as e:
             error = "Could not read the file: " + str(e)[:120]
     return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
@@ -2165,6 +2431,31 @@ def client_crosscheck(cid):
     return redirect(url_for("head_page", cid=cid, head="cross"))
 
 
+@app.route("/client/<cid>/file/<fid>")
+@login_required
+def open_client_file(cid, fid):
+    data = load_client(cid)
+    if not data:
+        return redirect(url_for("clients_page"))
+    fid = "".join(c for c in fid if c.isalnum())
+    entry = None
+    fs = data.get("fs") or {}
+    if fs.get("fid") == fid:
+        entry = {"name": fs.get("name", "file"), "ext": fs.get("ext", "")}
+    else:
+        for d in data.get("library", []):
+            if d.get("fid") == fid:
+                entry = {"name": d.get("name", "file"), "ext": d.get("ext", "")}
+                break
+    if not entry:
+        return "File not on record (it may predate file-saving, or the free server restarted).", 404
+    safe_cid = "".join(c for c in cid if c.isalnum())
+    path = os.path.join(CLIENT_FILES_DIR, safe_cid + "_" + fid + entry["ext"])
+    if not os.path.exists(path):
+        return "The stored copy is no longer available (the free server restarted).", 404
+    return send_file(path, as_attachment=True, download_name=entry["name"])
+
+
 @app.route("/hstatus", methods=["POST"])
 @login_required
 def hstatus():
@@ -2218,6 +2509,7 @@ def home():
                 # anchor pre-pass: if the user marked one file (e.g. the signed FS)
                 # as the anchor, extract it first so every other file is reviewed
                 # against it (tie-outs, contradictions, impossible dates, omissions)
+                include_hidden = request.form.get("hidden") == "on"
                 anchor_name = (request.form.get("anchor") or "").strip()
                 anchor_text = ""
                 if anchor_name and len(uploads) > 1:
@@ -2225,7 +2517,8 @@ def home():
                         if up.filename == anchor_name:
                             try:
                                 d = up.read()
-                                t = extract_text_from_file(up.filename, d) or ""
+                                t = extract_text_from_file(up.filename, d,
+                                        include_hidden=include_hidden) or ""
                                 anchor_text = t[:ANCHOR_CHARS]
                                 del d, t
                             except Exception:
@@ -2238,7 +2531,8 @@ def home():
                         entry["is_anchor"] = True
                     try:
                         data = up.read()
-                        text = extract_text_from_file(up.filename, data)
+                        text = extract_text_from_file(up.filename, data,
+                                include_hidden=include_hidden)
                         del data  # release the raw file bytes immediately
                         if text is None:
                             entry["error"] = "Unsupported file type."
@@ -2336,6 +2630,41 @@ def set_status():
         return {"error": "Unknown action."}, 400
     update_results(rid, batch)
     return {"ok": True}
+
+
+def fs_gate_with_ai(text):
+    """Check that an upload offered as the FS anchor really is financial
+    statements. Returns (is_fs, looks_like, err)."""
+    sample = text[:6000]
+    messages = [
+        {"role": "system", "content":
+            "You are a strict document classifier at an audit firm. Decide whether "
+            "the document is FINANCIAL STATEMENTS: a statement of financial "
+            "position / balance sheet, statement of profit or loss / income "
+            "statement, statement of cash flows, statement of changes in equity, "
+            "and/or the notes to the financial statements - complete or draft, "
+            "full set or a substantial extract. The following are NOT financial "
+            "statements: audit working papers, lead schedules, vouching or "
+            "verification sheets, trial balances, ledgers, planning memoranda, "
+            "checklists, engagement letters, bank statements, invoices, "
+            "correspondence, or any other document. "
+            "Return ONLY JSON: {\"is_fs\": true or false, "
+            "\"looks_like\": \"2-6 word description of what the document "
+            "actually appears to be\"}."},
+        {"role": "user", "content": "Document extract:\n\n" + sample},
+    ]
+    try:
+        response = client.chat.completions.create(
+            model=AI_MODEL, messages=messages,
+            max_tokens=200, temperature=0)
+        result, perr = parse_ai_json(response.choices[0].message.content.strip())
+        if perr or not isinstance(result, dict) or "is_fs" not in result:
+            return None, "", "The check could not be completed. Please try again."
+        return bool(result.get("is_fs")), str(result.get("looks_like", ""))[:120], None
+    except Exception as e:
+        err_name = type(e).__name__
+        return None, "", ("The AI check could not run (" + err_name
+                          + "). Please try again in a moment.")
 
 
 def client_cross_check_with_ai(data):
