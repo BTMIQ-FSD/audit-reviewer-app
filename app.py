@@ -121,7 +121,43 @@ HEADS = [
     ("exp", "Expenses and other income",
      "cost of sales, administrative expenses, distribution/selling expenses, finance cost, other operating expenses, other income, payroll expense testing"),
 ]
-HEAD_NAMES = {k: n for k, n, _ in HEADS}
+# File sections that sit alongside the balance-sheet/P&L heads
+SECTIONS = [
+    ("plan", "Planning",
+     "engagement acceptance and continuance, engagement letter, independence confirmations, planning memorandum, materiality and performance materiality computation, risk assessment, fraud risk, planned audit responses, team allocation and timetable"),
+    ("fin", "Finalisation",
+     "summary of uncorrected misstatements vs materiality, subsequent events review, going concern assessment, management representation letter, final analytical review, partner completion checklist, archiving checklist"),
+    ("perm", "Permanent file",
+     "certificate of incorporation, memorandum and articles of association, statutory forms and registers, loan and lease agreements, title documents, related party register, prior year financial statements, continuing-relevance updates"),
+]
+ALL_AREAS = HEADS + SECTIONS
+HEAD_NAMES = {k: n for k, n, _ in ALL_AREAS}
+
+# extra review focus for the file sections (appended to the standard WP brain)
+SECTION_FOCUS = {
+    "plan": ("SECTION FOCUS - PLANNING: check that materiality and performance "
+             "materiality are computed, the benchmark and percentages are stated "
+             "and consistent with the client financial statements; identified "
+             "risks are each linked to a planned response; the engagement letter "
+             "and independence confirmations exist and are for the CURRENT year; "
+             "planning sign-offs are dated BEFORE the fieldwork/review dates; and "
+             "the planning memorandum covers the entity's business, applicable "
+             "framework, and team allocation."),
+    "fin": ("SECTION FOCUS - FINALISATION: check that the summary of uncorrected "
+            "misstatements is totalled and compared with materiality; subsequent "
+            "events procedures extend to the audit report date; the going concern "
+            "assessment is documented and consistent with the financial "
+            "statements; the management representation letter is dated the same "
+            "date as (or immediately before) the audit report; all review notes "
+            "and open points are cleared before archiving; and the completion "
+            "checklist is signed."),
+    "perm": ("SECTION FOCUS - PERMANENT FILE: check that documents are current, "
+             "legible and complete; loan and lease agreement terms (amounts, "
+             "rates, security) agree with the financial statement disclosures; "
+             "statutory records agree with issued share capital per the FS; "
+             "related party register is consistent with FS related party "
+             "disclosures; and outdated items are flagged for update."),
+}
 
 # which heads inform each other's review (evidence library cross-feeding)
 RELATED_HEADS = {
@@ -492,12 +528,13 @@ def review_with_ai(document_text, mode="wp", user_instructions="",
 
 
 def head_review_with_ai(document_text, head_key, prior_points,
-                        user_instructions="", related_docs=None):
+                        user_instructions="", related_docs=None,
+                        fs_name="", fs_text=""):
     """Review one file inside a client head: guard the head, re-check open
     points against new evidence, and raise new findings."""
     head_name = HEAD_NAMES.get(head_key, "")
-    examples = next((e for k, n, e in HEADS if k == head_key), "")
-    all_heads = "; ".join(n + " (" + e + ")" for k, n, e in HEADS)
+    examples = next((e for k, n, e in ALL_AREAS if k == head_key), "")
+    all_heads = "; ".join(n + " (" + e + ")" for k, n, e in ALL_AREAS)
     trimmed = document_text[:MAX_EXTRACT_CHARS]
     messages = [
         {"role": "system", "content": REVIEWER_INSTRUCTIONS},
@@ -515,6 +552,25 @@ def head_review_with_ai(document_text, head_key, prior_points,
             "\"point_updates\" (see below; [] if none), "
             "\"summary\", \"conclusion\"."},
     ]
+    if head_key in SECTION_FOCUS:
+        messages.append({"role": "system", "content": SECTION_FOCUS[head_key]})
+    if fs_text:
+        messages.append({"role": "system", "content":
+            "CLIENT FINANCIAL STATEMENTS (\"" + fs_name + "\") — the master anchor "
+            "for this whole engagement — extract:\n\n" + fs_text +
+            "\n\nFS CROSS-CHECK REQUIREMENT: in addition to the normal review, "
+            "check the document below AGAINST these financial statements:\n"
+            "(1) TIE-OUTS: amounts that should agree with the face of the "
+            "statements or the notes — report disagreements quoting BOTH figures;\n"
+            "(2) CONTRADICTIONS: matters disclosed in the FS but ignored or "
+            "treated inconsistently in the working paper, and vice versa;\n"
+            "(3) IMPOSSIBLE DATES: evidence dated after the audit report date, or "
+            "outside the financial year;\n"
+            "(4) OMISSIONS: items in the FS this working paper should cover but "
+            "does not, or vice versa.\n"
+            "Tie-out failures and direct contradictions with the FS are High "
+            "severity; name the FS note/statement and the working paper location "
+            "in each such finding."})
     if related_docs:
         parts = []
         for d in related_docs:
@@ -1074,6 +1130,31 @@ CLIENT_HEADS_PAGE = """
   <a href="{{ url_for('logout') }}">Log out</a></div></div>
 <div class="wrap">
  {% if error %}<div style="background:#FBE9E7;border:1px solid #E5B5AC;color:#8C2F22;border-radius:8px;padding:11px 13px;font-size:13px;margin-bottom:14px;">{{ error }}</div>{% endif %}
+ {% if okmsg %}<div style="background:#E2F2E9;border:1px solid #B5D8C4;color:#1F6B4F;border-radius:8px;padding:11px 13px;font-size:13px;margin-bottom:14px;">{{ okmsg }}</div>{% endif %}
+
+ <div style="background:#fff;border:2px solid {{ '#1F6B4F' if client.get('fs') else '#E8B84B' }};border-radius:12px;padding:16px 18px;margin-bottom:18px;">
+  <b style="font-size:14px;">&#128209; Financial statements — engagement anchor</b>
+  {% if client.get('fs') %}
+    <div style="font-size:12.5px;color:#1F6B4F;margin-top:7px;">&#10003; On record: <b>{{ client['fs']['name'] }}</b>
+      <span style="color:#8595A5;">(saved {{ client['fs']['time'] }})</span></div>
+    <div style="font-size:11.5px;color:#5B7083;margin-top:4px;">Every working paper reviewed in any head is automatically checked against these FS (tie-outs, contradictions, impossible dates, omissions).</div>
+    <form method="post" action="{{ url_for('client_fs', cid=client['cid']) }}" enctype="multipart/form-data" style="margin-top:9px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <input type="file" name="fsfile" accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt" style="font-size:12px;">
+      <button type="submit" style="background:#EFF2F4;color:#3A4A64;border:1px solid #D9DDE1;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:600;cursor:pointer;">Replace FS</button>
+    </form>
+    <form method="post" action="{{ url_for('client_fsreview', cid=client['cid']) }}" style="margin-top:8px;"
+          onsubmit="this.querySelector('button').textContent='Reviewing FS... please wait';">
+      <button type="submit" style="background:#00A09B;color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:12.5px;font-weight:600;cursor:pointer;">&#128209; Run financial statements review</button>
+    </form>
+  {% else %}
+    <div style="font-size:12.5px;color:#8A5E12;margin-top:7px;">Not uploaded yet — upload the client's financial statements once, and every working paper in every head will automatically be reviewed against them.</div>
+    <form method="post" action="{{ url_for('client_fs', cid=client['cid']) }}" enctype="multipart/form-data" style="margin-top:9px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <input type="file" name="fsfile" accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt" style="font-size:12px;">
+      <button type="submit" style="background:#00A09B;color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:12.5px;font-weight:600;cursor:pointer;">Save FS as anchor</button>
+    </form>
+  {% endif %}
+ </div>
+
  <p style="font-size:13px;color:#5B7083;">Choose a head to review its working papers:</p>
  <div class="grid">
   {% for k, n, e in heads %}
@@ -1086,6 +1167,28 @@ CLIENT_HEADS_PAGE = """
     {% if pts %}<div class="badges"><span class="bp">{{ open }} open</span><span class="br">{{ res }} resolved</span></div>{% endif %}
    </a>
   {% endfor %}
+ </div>
+
+ <p style="font-size:13px;color:#5B7083;margin-top:20px;">File sections:</p>
+ <div class="grid">
+  {% for k, n, e in sections %}
+   {% set pts = client.get('heads', {}).get(k, {}).get('points', []) %}
+   {% set open = pts | selectattr('status', 'equalto', 'pending') | list | length %}
+   {% set res = pts | selectattr('status', 'equalto', 'resolved') | list | length %}
+   <a class="hd" href="{{ url_for('head_page', cid=client['cid'], head=k) }}">
+    <b>{{ n }}</b>
+    <small>{{ e[:90] }}...</small>
+    {% if pts %}<div class="badges"><span class="bp">{{ open }} open</span><span class="br">{{ res }} resolved</span></div>{% endif %}
+   </a>
+  {% endfor %}
+  {% set fpts = client.get('heads', {}).get('fsr', {}).get('points', []) %}
+  {% if fpts %}
+   <a class="hd" style="border-color:#00A09B;" href="{{ url_for('head_page', cid=client['cid'], head='fsr') }}">
+    <b>&#128209; Financial statements review</b>
+    <small>The anchored FS reviewed on their own</small>
+    <div class="badges"><span class="bp">{{ fpts | selectattr('status','equalto','pending') | list | length }} open</span></div>
+   </a>
+  {% endif %}
   {% set cpts = client.get('heads', {}).get('cross', {}).get('points', []) %}
   {% if cpts %}
    <a class="hd" style="border-color:#5B4FC0;" href="{{ url_for('head_page', cid=client['cid'], head='cross') }}">
@@ -1808,19 +1911,26 @@ def client_heads(cid):
     if not data:
         return redirect(url_for("clients_page"))
     return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
-                                  error=None, head_names=HEAD_NAMES)
+                                  sections=SECTIONS, error=None, okmsg=None,
+                                  head_names=HEAD_NAMES)
 
 
 @app.route("/client/<cid>/<head>", methods=["GET", "POST"])
 @login_required
 def head_page(cid, head):
     data = load_client(cid)
-    is_cross = (head == "cross")
+    is_cross = head in ("cross", "fsr")   # button-driven sections: no upload form
     if not data or (head not in HEAD_NAMES and not is_cross):
         return redirect(url_for("clients_page"))
-    head_name = "Cross-head checks" if is_cross else HEAD_NAMES[head]
-    head_examples = ("inconsistencies between heads: debtors vs revenue, advances vs sales, depreciation vs assets, finance cost vs borrowings"
-                     if is_cross else next(e for k, n, e in HEADS if k == head))
+    if head == "cross":
+        head_name = "Cross-head checks"
+        head_examples = "inconsistencies between heads: debtors vs revenue, advances vs sales, depreciation vs assets, finance cost vs borrowings"
+    elif head == "fsr":
+        head_name = "Financial statements review"
+        head_examples = "the anchored FS reviewed on their own: presentation, tie-outs between face and notes, disclosures, arithmetic"
+    else:
+        head_name = HEAD_NAMES[head]
+        head_examples = next(e for k, n, e in ALL_AREAS if k == head)
     hd = data.setdefault("heads", {}).setdefault(head, {"points": [], "rounds": []})
     error = None
     okmsg = None
@@ -1860,9 +1970,12 @@ def head_page(cid, head):
                                                 "head_name": HEAD_NAMES.get(d["head"], d["head"]),
                                                 "excerpt": d["excerpt"][:8000]})
                                 budget -= 1
+                        fs = data.get("fs") or {}
                         result, ai_err = head_review_with_ai(
                             text, head, hd["points"], instructions,
-                            related_docs=related)
+                            related_docs=related,
+                            fs_name=fs.get("name", ""),
+                            fs_text=fs.get("excerpt", ""))
                         keep_excerpt = text[:12000]
                         del text
                         if ai_err:
@@ -1871,7 +1984,7 @@ def head_page(cid, head):
                         if result.get("wrong_head"):
                             other = result["wrong_head"]
                             link = ""
-                            for k2, n2, _e2 in HEADS:
+                            for k2, n2, _e2 in ALL_AREAS:
                                 if n2.lower() == str(other).strip().lower():
                                     link = url_for("head_page", cid=cid, head=k2)
                                     break
@@ -1940,6 +2053,82 @@ def head_page(cid, head):
                                   error=error, okmsg=okmsg, is_cross=is_cross)
 
 
+@app.route("/client/<cid>/fs", methods=["POST"])
+@login_required
+def client_fs(cid):
+    data = load_client(cid)
+    if not data:
+        return redirect(url_for("clients_page"))
+    up = request.files.get("fsfile")
+    error = None
+    okmsg = None
+    if not up or not up.filename:
+        error = "Please choose the financial statements file."
+    else:
+        try:
+            raw = up.read()
+            text = extract_text_from_file(up.filename, raw)
+            del raw
+            if text is None:
+                error = "Unsupported file type for the financial statements."
+            elif not text.strip():
+                error = ("No readable text found in that file (a scanned PDF "
+                         "without a text layer, perhaps).")
+            else:
+                data["fs"] = {"name": up.filename,
+                              "excerpt": text[:ANCHOR_CHARS],
+                              "time": time.strftime("%d %b %Y, %H:%M")}
+                del text
+                save_client(data)
+                okmsg = ("Financial statements saved as the engagement anchor. "
+                         "Every working paper reviewed in any head will now also "
+                         "be checked against them automatically.")
+        except Exception as e:
+            error = "Could not read the file: " + str(e)[:120]
+    return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
+                                  sections=SECTIONS, error=error, okmsg=okmsg,
+                                  head_names=HEAD_NAMES)
+
+
+@app.route("/client/<cid>/fsreview", methods=["POST"])
+@login_required
+def client_fsreview(cid):
+    data = load_client(cid)
+    if not data:
+        return redirect(url_for("clients_page"))
+    if not AI_KEY_SET:
+        return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
+                                      sections=SECTIONS, error="The AI API key is not set.",
+                                      okmsg=None, head_names=HEAD_NAMES)
+    fs = data.get("fs") or {}
+    if not fs.get("excerpt"):
+        return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
+                                      sections=SECTIONS, okmsg=None, head_names=HEAD_NAMES,
+                                      error="Upload the financial statements (anchor) first — the FS review reviews that file.")
+    result, err = review_with_ai(fs["excerpt"], mode="fs")
+    if err:
+        return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
+                                      sections=SECTIONS, error=err, okmsg=None,
+                                      head_names=HEAD_NAMES)
+    hd = data.setdefault("heads", {}).setdefault("fsr", {"points": [], "rounds": []})
+    now = time.strftime("%d %b %Y, %H:%M")
+    next_id = max([p["id"] for p in hd["points"]], default=0) + 1
+    for f in result.get("findings", []):
+        hd["points"].append({
+            "id": next_id, "title": str(f.get("title", ""))[:200],
+            "explanation": str(f.get("explanation", ""))[:1500],
+            "reference": str(f.get("reference", ""))[:300],
+            "severity": f.get("severity", "Medium"),
+            "fix": str(f.get("fix", ""))[:800],
+            "status": "pending", "flagged": False,
+            "time": now, "source": fs.get("name", "financial statements")})
+        next_id += 1
+    hd["rounds"].append({"time": now, "files": [fs.get("name", "")],
+                         "conclusion": str(result.get("conclusion", ""))[:600]})
+    save_client(data)
+    return redirect(url_for("head_page", cid=cid, head="fsr"))
+
+
 @app.route("/client/<cid>/crosscheck", methods=["POST"])
 @login_required
 def client_crosscheck(cid):
@@ -1948,12 +2137,14 @@ def client_crosscheck(cid):
         return redirect(url_for("clients_page"))
     if not AI_KEY_SET:
         return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
+                                      sections=SECTIONS,
                                       error="The AI API key is not set.",
-                                      head_names=HEAD_NAMES)
+                                      okmsg=None, head_names=HEAD_NAMES)
     result, err = client_cross_check_with_ai(data)
     if err:
         return render_template_string(CLIENT_HEADS_PAGE, client=data, heads=HEADS,
-                                      error=err, head_names=HEAD_NAMES)
+                                      sections=SECTIONS, error=err, okmsg=None,
+                                      head_names=HEAD_NAMES)
     hd = data.setdefault("heads", {}).setdefault("cross", {"points": [], "rounds": []})
     now = time.strftime("%d %b %Y, %H:%M")
     next_id = max([p["id"] for p in hd["points"]], default=0) + 1
@@ -2150,15 +2341,20 @@ def set_status():
 def client_cross_check_with_ai(data):
     """One pass across everything on record for a client: hunt inter-head
     inconsistencies (figures, parties, dates, treatments)."""
-    lib = data.get("library", [])[:12]
+    lib = list(data.get("library", []))[:12]
+    fs = data.get("fs") or {}
+    if fs.get("excerpt"):
+        lib = [{"name": fs.get("name", "financial statements"),
+                "head": "fs", "excerpt": fs["excerpt"]}] + lib
     if len(lib) < 2:
         return None, ("At least two files (in different heads) must be on record "
                       "before a client-wide cross-check can run.")
     parts = []
     for d in lib:
-        parts.append("--- HEAD \"" + HEAD_NAMES.get(d["head"], d["head"])
-                     + "\", FILE \"" + d["name"] + "\" (excerpt) ---\n"
-                     + d["excerpt"][:6000])
+        label = ("FINANCIAL STATEMENTS (MASTER ANCHOR)" if d["head"] == "fs"
+                 else "HEAD \"" + HEAD_NAMES.get(d["head"], d["head"]) + "\"")
+        parts.append("--- " + label + ", FILE \"" + d["name"]
+                     + "\" (excerpt) ---\n" + d["excerpt"][:6000])
     open_pts = []
     for k, hd in data.get("heads", {}).items():
         for p in hd.get("points", []):
