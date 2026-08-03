@@ -41,6 +41,14 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib import colors
 
+from datetime import datetime, timedelta, timezone
+PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time (no DST)
+
+
+def now_pk(fmt="%d %b %Y, %H:%M"):
+    return datetime.now(PKT).strftime(fmt)
+
+
 app = Flask(__name__)
 UPLOAD_LIMIT_MB = 50
 app.config["MAX_CONTENT_LENGTH"] = UPLOAD_LIMIT_MB * 1024 * 1024
@@ -954,7 +962,7 @@ def _append_history(rid, user, mode, batch):
     hist = load_history()
     entry = {
         "rid": rid,
-        "time": time.strftime("%d %b %Y, %H:%M"),
+        "time": now_pk(),
         "user": user,
         "mode": "FS" if mode == "fs" else "WP",
         "files": [it.get("filename", "") for it in batch.get("files", [])],
@@ -1786,7 +1794,8 @@ HEAD_PAGE = """
  <div class="card">
   <h2>Upload working papers or additional evidence &mdash; {{ head_name }}</h2>
   <form method="post" enctype="multipart/form-data" onsubmit="document.getElementById('spin').style.display='block'">
-   <input type="file" name="files" multiple accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt">
+   <input type="file" name="files" id="headfiles" multiple accept=".xlsx,.xlsm,.docx,.pdf,.csv,.txt">
+   <div id="headfilelist" style="font-size:12px;color:#3A4A64;margin-top:8px;line-height:1.8;"></div>
    <textarea class="instr" name="instructions" maxlength="2000"
      placeholder="Optional instructions, e.g. This file answers point 3 - the missing conclusion has been added, please re-check"></textarea>
    <label style="display:block;margin-top:9px;font-size:12.5px;color:#3A4A64;cursor:pointer;">
@@ -1802,8 +1811,16 @@ HEAD_PAGE = """
 
  {% if points %}
  <div class="card">
-  <h2>Review points &mdash; {{ head_name }}</h2>
-  <div class="sbar">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+   <h2 style="margin:0;">Review points &mdash; {{ head_name }}</h2>
+   <div>
+    <a href="{{ url_for('head_export', cid=client['cid'], head=head_key, fmt='xlsx') }}"
+       style="display:inline-block;background:#1F6B4F;color:#fff;text-decoration:none;font-size:12px;font-weight:600;padding:7px 14px;border-radius:8px;margin-right:6px;">&#11015; Excel</a>
+    <a href="{{ url_for('head_export', cid=client['cid'], head=head_key, fmt='pdf') }}"
+       style="display:inline-block;background:#B23A2E;color:#fff;text-decoration:none;font-size:12px;font-weight:600;padding:7px 14px;border-radius:8px;">&#11015; PDF</a>
+   </div>
+  </div>
+  <div class="sbar" style="margin-top:12px;">
     <span class="sb" id="sb-t"></span><span class="sb p" id="sb-p"></span>
     <span class="sb r" id="sb-r"></span><span class="sb x" id="sb-x"></span>
     <span class="sb fl" id="sb-f"></span>
@@ -1879,6 +1896,40 @@ HEAD_PAGE = """
 </div>
 <script>
 const CID = {{ client['cid'] | tojson }};
+const HMAX = {{ maxfiles }};
+(function(){
+  const inp = document.getElementById('headfiles');
+  const lst = document.getElementById('headfilelist');
+  if(!inp || !lst) return;
+  let picked = [];
+  function sync(){
+    const dt = new DataTransfer();
+    picked.forEach(f => dt.items.add(f));
+    inp.files = dt.files;
+    if(picked.length === 0){ lst.innerHTML=''; return; }
+    let h = '';
+    picked.forEach((f,i)=>{
+      h += '<div>&#128196; ' + f.name.replace(/</g,'&lt;')
+        + ' <a href="#" data-i="'+i+'" class="hfrm" style="color:#B23A2E;font-weight:700;text-decoration:none;margin-left:6px;" title="Remove">&#10005;</a></div>';
+    });
+    h += '<div style="margin-top:4px;"><b>' + picked.length + ' of ' + HMAX + ' files</b> &mdash; add more any time before pressing Review</div>';
+    lst.innerHTML = h;
+    lst.querySelectorAll('.hfrm').forEach(a => a.onclick = function(e){
+      e.preventDefault(); picked.splice(parseInt(this.dataset.i),1); sync();
+    });
+  }
+  inp.addEventListener('change', function(){
+    let cap=false, dup=0;
+    for(const f of inp.files){
+      if(picked.length >= HMAX){ cap=true; break; }
+      if(picked.some(p=>p.name===f.name && p.size===f.size)){ dup++; continue; }
+      picked.push(f);
+    }
+    sync();
+    if(cap) alert('Maximum ' + HMAX + ' files per review.');
+    else if(dup) alert(dup + ' file(s) skipped: already in the list.');
+  });
+})();
 const HEAD = {{ head_key | tojson }};
 function hcount(){
   const ps = document.querySelectorAll('.pt');
@@ -2479,7 +2530,7 @@ def clients_page():
             else:
                 cid = uuid.uuid4().hex[:10]
                 clients.insert(0, {"cid": cid, "name": name,
-                                   "created": time.strftime("%d %b %Y")})
+                                   "created": now_pk("%d %b %Y")})
                 save_clients(clients)
                 save_client({"cid": cid, "name": name, "heads": {}})
                 return redirect(url_for("client_heads", cid=cid))
@@ -2565,7 +2616,7 @@ def client_import():
             data["cid"] = cid
             meta = payload.get("meta") or {}
             clients.insert(0, {"cid": cid, "name": data["name"],
-                               "created": meta.get("created", time.strftime("%d %b %Y")),
+                               "created": meta.get("created", now_pk("%d %b %Y")),
                                "status": meta.get("status", "active")})
             save_clients(clients)
             save_client(data)
@@ -2676,7 +2727,7 @@ def head_page(cid, head):
                             discard_client_file(cid, stored_fid, stored_ext)
                             wrongs.append(msg)
                             continue
-                        now = time.strftime("%d %b %Y, %H:%M")
+                        now = now_pk()
                         for upd in result.get("point_updates", []):
                             try:
                                 pid = int(upd.get("id"))
@@ -2733,7 +2784,8 @@ def head_page(cid, head):
                                   head_name=head_name, head_examples=head_examples,
                                   points=hd["points"], rounds=hd["rounds"],
                                   error=error, okmsg=okmsg, is_cross=is_cross,
-                                  head_names=HEAD_NAMES)
+                                  head_names=HEAD_NAMES,
+                                  maxfiles=MAX_FILES_PER_BATCH)
 
 
 @app.route("/client/<cid>/fs", methods=["POST"])
@@ -2774,7 +2826,7 @@ def client_fs(cid):
                     fs_fid, fs_ext = store_client_file(cid, up.filename, up.read())
                     data["fs"] = {"name": up.filename,
                                   "excerpt": text[:ANCHOR_CHARS],
-                                  "time": time.strftime("%d %b %Y, %H:%M"),
+                                  "time": now_pk(),
                                   "fid": fs_fid, "ext": fs_ext}
                     save_client(data)
                     okmsg = ("Financial statements saved as the engagement anchor. "
@@ -2809,7 +2861,7 @@ def client_fsreview(cid):
                                       sections=SECTIONS, error=err, okmsg=None,
                                       head_names=HEAD_NAMES)
     hd = data.setdefault("heads", {}).setdefault("fsr", {"points": [], "rounds": []})
-    now = time.strftime("%d %b %Y, %H:%M")
+    now = now_pk()
     next_id = max([p["id"] for p in hd["points"]], default=0) + 1
     for f in result.get("findings", []):
         hd["points"].append({
@@ -2844,7 +2896,7 @@ def client_crosscheck(cid):
                                       sections=SECTIONS, error=err, okmsg=None,
                                       head_names=HEAD_NAMES)
     hd = data.setdefault("heads", {}).setdefault("cross", {"points": [], "rounds": []})
-    now = time.strftime("%d %b %Y, %H:%M")
+    now = now_pk()
     next_id = max([p["id"] for p in hd["points"]], default=0) + 1
     for f in result.get("findings", []):
         hd["points"].append({
@@ -2991,6 +3043,49 @@ def hdiscuss():
     del disc[:-20]
     save_client(data)
     return {"answer": answer, "shown_q": shown_q}
+
+
+@app.route("/client/<cid>/<head>/export/<fmt>")
+@login_required
+def head_export(cid, head, fmt):
+    data = load_client(cid)
+    if not data:
+        return redirect(url_for("clients_page"))
+    if head == "cross":
+        head_name = "Cross-head checks"
+    elif head == "fsr":
+        head_name = "Financial statements review"
+    elif head in HEAD_NAMES:
+        head_name = HEAD_NAMES[head]
+    else:
+        return redirect(url_for("client_heads", cid=cid))
+    hd = data.get("heads", {}).get(head, {"points": [], "rounds": []})
+    pts = hd.get("points", [])
+    if not pts:
+        return redirect(url_for("head_page", cid=cid, head=head))
+    rounds = hd.get("rounds", [])
+    counts = {"pending": 0, "resolved": 0, "rejected": 0}
+    for p in pts:
+        counts[p.get("status", "pending")] = counts.get(p.get("status", "pending"), 0) + 1
+    batch = {"files": [{
+        "filename": data.get("name", "") + " — " + head_name,
+        "result": {
+            "findings": pts,
+            "summary": (str(len(pts)) + " point(s): " + str(counts["pending"])
+                        + " open, " + str(counts["resolved"]) + " resolved, "
+                        + str(counts["rejected"]) + " rejected. Exported "
+                        + now_pk() + " PKT."),
+            "conclusion": (rounds[-1].get("conclusion", "") if rounds else ""),
+        }}]}
+    safe = "".join(ch if ch.isalnum() or ch in " -_" else "_"
+                   for ch in data.get("name", "client") + "_" + head_name).replace(" ", "_")
+    if fmt == "xlsx":
+        buf = build_excel(batch)
+        return send_file(buf, as_attachment=True, download_name=safe + ".xlsx",
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    buf = build_pdf(batch)
+    return send_file(buf, as_attachment=True, download_name=safe + ".pdf",
+                     mimetype="application/pdf")
 
 
 @app.route("/hstatus", methods=["POST"])
