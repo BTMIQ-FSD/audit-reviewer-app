@@ -127,6 +127,10 @@ def current_engine():
     return e if e in ENGINES else DEFAULT_ENGINE
 
 
+class EmptyAIResponse(Exception):
+    pass
+
+
 def ai_chat(messages, max_tokens=6000, temperature=0.2, cheap=False):
     """One door to both engines. cheap=True routes tiny classification jobs
     to DeepSeek even when Claude is selected (no point paying Claude prices
@@ -135,9 +139,31 @@ def ai_chat(messages, max_tokens=6000, temperature=0.2, cheap=False):
     if cheap and "deepseek" in ENGINES:
         name = "deepseek"
     eng = ENGINES[name]
-    return eng["client"].chat.completions.create(
-        model=eng["model"], messages=messages,
-        max_tokens=max_tokens, temperature=temperature)
+    kwargs = {"model": eng["model"], "messages": messages,
+              "max_tokens": max_tokens, "temperature": temperature}
+    if name == "deepseek":
+        # V4 models default to "thinking" mode, which can consume the whole
+        # response budget internally and return EMPTY content. The retired
+        # deepseek-chat name was the NON-thinking mode, so we ask for that
+        # explicitly (per DeepSeek's docs: set thinking mode explicitly).
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    response = eng["client"].chat.completions.create(**kwargs)
+    content = ""
+    try:
+        content = (response.choices[0].message.content or "").strip()
+    except Exception:
+        content = ""
+    if not content:
+        # known DeepSeek V4 issue: intermittent completely empty responses.
+        # One retry usually clears it; if not, fail with a clear name.
+        response = eng["client"].chat.completions.create(**kwargs)
+        try:
+            content = (response.choices[0].message.content or "").strip()
+        except Exception:
+            content = ""
+        if not content:
+            raise EmptyAIResponse("the AI returned an empty response twice")
+    return response
 
 
 # kept for backward references
@@ -681,6 +707,10 @@ def review_with_ai(document_text, mode="wp", user_instructions="",
         response = ai_chat(messages, max_tokens=6000, temperature=0.2)
     except Exception as e:
         err_name = type(e).__name__
+        if err_name == "EmptyAIResponse":
+            return None, ("The AI returned an empty answer for this request "
+                          "(a known DeepSeek issue). Please press the review "
+                          "button again — or switch to the other engine.")
         if "Timeout" in err_name or "timeout" in str(e).lower():
             return None, ("The AI service took too long to respond for this file "
                           "(over 5 minutes including a retry). This is usually "
@@ -776,6 +806,10 @@ def head_review_with_ai(document_text, head_key, prior_points,
         response = ai_chat(messages, max_tokens=6000, temperature=0.2)
     except Exception as e:
         err_name = type(e).__name__
+        if err_name == "EmptyAIResponse":
+            return None, ("The AI returned an empty answer for this request "
+                          "(a known DeepSeek issue). Please press the review "
+                          "button again — or switch to the other engine.")
         if "Timeout" in err_name or "timeout" in str(e).lower():
             return None, ("The AI service took too long to respond for this file. "
                           "Please try again in a few minutes.")
@@ -2942,6 +2976,10 @@ def hdiscuss():
         answer = response.choices[0].message.content.strip()
     except Exception as e:
         err_name = type(e).__name__
+        if err_name == "EmptyAIResponse":
+            return None, ("The AI returned an empty answer for this request "
+                          "(a known DeepSeek issue). Please press the review "
+                          "button again — or switch to the other engine.")
         if "Timeout" in err_name or "timeout" in str(e).lower():
             return {"error": "The AI took too long. Please try again."}, 504
         return {"error": "The AI could not be reached (" + err_name + ")."}, 502
@@ -3215,6 +3253,10 @@ def client_cross_check_with_ai(data):
         response = ai_chat(messages, max_tokens=5000, temperature=0.2)
     except Exception as e:
         err_name = type(e).__name__
+        if err_name == "EmptyAIResponse":
+            return None, ("The AI returned an empty answer for this request "
+                          "(a known DeepSeek issue). Please press the review "
+                          "button again — or switch to the other engine.")
         if "Timeout" in err_name or "timeout" in str(e).lower():
             return None, "The AI took too long. Please try again."
         return None, "The AI could not be reached. Details: " + err_name
@@ -3288,6 +3330,10 @@ def discuss():
         answer = response.choices[0].message.content.strip()
     except Exception as e:
         err_name = type(e).__name__
+        if err_name == "EmptyAIResponse":
+            return None, ("The AI returned an empty answer for this request "
+                          "(a known DeepSeek issue). Please press the review "
+                          "button again — or switch to the other engine.")
         if "Timeout" in err_name or "timeout" in str(e).lower():
             return {"error": "The AI took too long to answer. Please try again."}, 504
         return {"error": "The AI could not be reached. Please try again. "
