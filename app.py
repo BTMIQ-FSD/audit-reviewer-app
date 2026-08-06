@@ -1327,6 +1327,11 @@ COMMON_UI = """
 
 
 
+ .sb{cursor:pointer;user-select:none;transition:box-shadow .15s ease,transform .15s ease;}
+ .sb:hover{transform:translateY(-1px);}
+ .sb.active{box-shadow:0 0 0 2px #00A09B inset;font-weight:800;}
+ .filtered-out{display:none !important;}
+ .filterhint{font-size:11px;color:#8595A5;margin:-6px 0 10px;display:none;}
  .fontctl{position:fixed;bottom:14px;right:14px;z-index:50;display:flex;gap:6px;
    background:rgba(12,27,52,.85);border-radius:20px;padding:6px 10px;}
  .fontctl button{background:none;border:none;color:#9FE1CB;font-weight:700;font-size:14px;
@@ -1351,6 +1356,36 @@ document.addEventListener('DOMContentLoaded', function(){
   }
   bs[0].onclick = function(){ setFs(-10); };
   bs[1].onclick = function(){ setFs(10); };
+
+  // clickable status filters on any counts bar (head pages + general review)
+  window.btFilter = null;
+  function btApplyFilter(items){
+    items.forEach(function(el){
+      var s = el.dataset.status || 'pending';
+      var fl = el.dataset.flag === '1';
+      var show = !window.btFilter
+        || (window.btFilter === 'flagged' ? fl : s === window.btFilter);
+      el.classList.toggle('filtered-out', !show);
+    });
+    var hint = document.getElementById('filterhint');
+    if(hint) hint.style.display = window.btFilter ? 'block' : 'none';
+  }
+  window.btRefilter = function(){
+    btApplyFilter(document.querySelectorAll('.pt, .finding'));
+  };
+  var chipmap = {'sb-p':'pending','sb-r':'resolved','sb-x':'rejected','sb-f':'flagged','sb-t':null};
+  Object.keys(chipmap).forEach(function(id){
+    var chip = document.getElementById(id);
+    if(!chip) return;
+    chip.title = id === 'sb-t' ? 'Show all' : 'Click to show only these';
+    chip.addEventListener('click', function(){
+      var want = chipmap[id];
+      window.btFilter = (window.btFilter === want) ? null : want;
+      document.querySelectorAll('.sb').forEach(function(c){ c.classList.remove('active'); });
+      if(window.btFilter) chip.classList.add('active');
+      window.btRefilter();
+    });
+  });
 
   if(document.body.classList.contains('darkbg')){
     var colors = ['#2dd4bf','#5eead4','#7c6cf0','#9FE1CB'];
@@ -1825,6 +1860,7 @@ HEAD_PAGE = """
     <span class="sb r" id="sb-r"></span><span class="sb x" id="sb-x"></span>
     <span class="sb fl" id="sb-f"></span>
   </div>
+  <div class="filterhint" id="filterhint">Filter active &mdash; click the highlighted chip again (or Total) to show everything.</div>
   {% for p in points %}
    <div class="pt" data-pid="{{ p['id'] }}" data-status="{{ p.get('status','pending') }}"
         data-flag="{{ '1' if p.get('flagged') else '0' }}">
@@ -1944,7 +1980,7 @@ function hcount(){
 function hpost(el, action, ok){
   fetch('/hstatus',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({cid:CID,head:HEAD,pid:parseInt(el.dataset.pid),action:action})})
-   .then(r=>r.json()).then(d=>{ if(d.ok){ok();hcount();} else alert(d.error||'Could not save.'); })
+   .then(r=>r.json()).then(d=>{ if(d.ok){ok();hcount();if(window.btRefilter)window.btRefilter();} else alert(d.error||'Could not save.'); })
    .catch(()=>alert('Could not reach the server.'));
 }
 function hstat(btn,s){ const el=btn.closest('.pt'); hpost(el,s,()=>{el.dataset.status=s;}); }
@@ -2359,6 +2395,7 @@ function recount(){
   });
   const set = (id, txt) => { const e = document.getElementById(id); if(e) e.textContent = txt; };
   set('sb-t', 'Total: ' + fs.length);
+  if(window.btRefilter) window.btRefilter();
   set('sb-p', 'Pending: ' + p);
   set('sb-r', 'Resolved: ' + r);
   set('sb-x', 'Rejected: ' + x);
